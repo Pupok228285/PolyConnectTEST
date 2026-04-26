@@ -35,7 +35,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 # ===================== НАСТРОЙКИ =====================
 
-load_dotenv()
+#load_dotenv()
 
 API_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 COMPLAINT_BOT_TOKEN = os.getenv("HELPER_BOT_TOKEN")
