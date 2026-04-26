@@ -1,0 +1,7 @@
+aiogram
+pyTelegramBotAPI
+aiosqlite
+python-dotenv
+aiohttp
+asyncpg
+apscheduler
