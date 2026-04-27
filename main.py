@@ -222,6 +222,7 @@ def can_use_story(tg_id: int) -> bool:
 
 async def init_db():
     async with pool.acquire() as conn:
+        # 1. Базовые таблицы
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -271,7 +272,8 @@ async def init_db():
                 value TEXT
             );
         """)
-        # === LIKE MESSAGE === Таблица для хранения сообщений к лайкам
+
+        # 2. Таблицы для фич
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS like_messages (
                 id SERIAL PRIMARY KEY,
@@ -283,7 +285,6 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
-        # === GEO NETWORKING === Таблица для хранения выборов локации
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS geo_locations (
                 id SERIAL PRIMARY KEY,
@@ -295,7 +296,8 @@ async def init_db():
                 UNIQUE(tg_id, date)
             );
         """)
-        # === STORY (БОЧКА) === Таблица для хранения вопросов
+
+        # === STORY (БОЧКА) ===
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS story_questions (
                 id SERIAL PRIMARY KEY,
@@ -305,7 +307,9 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
-        # === STORY (БОЧКА) === Таблица для хранения ответов юзеров
+        # ФИКС для story_questions (если таблицы создались давно без этой колонки)
+        await conn.execute("ALTER TABLE story_questions ADD COLUMN IF NOT EXISTS week_start DATE;")
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS story_answers (
                 id SERIAL PRIMARY KEY,
@@ -316,7 +320,7 @@ async def init_db():
                 UNIQUE(tg_id, question_id)
             );
         """)
-        # === STORY (БОЧКА) === Таблица активных участников недели
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS story_participants (
                 id SERIAL PRIMARY KEY,
@@ -327,19 +331,17 @@ async def init_db():
                 UNIQUE(tg_id, week_start)
             );
         """)
+        # ФИКСЫ для story_participants
+        await conn.execute(
+            "ALTER TABLE story_participants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
+        await conn.execute("ALTER TABLE story_participants ADD COLUMN IF NOT EXISTS week_start DATE;")
+
+        # 3. Проверка настроек
         row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", "hide_matched")
         if row is None:
-            await conn.execute(
-                "INSERT INTO settings (key, value) VALUES ($1, $2)",
-                "hide_matched", "1",
-            )
-        await conn.execute("""
-                    ALTER TABLE story_participants 
-                    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-                """)
+            await conn.execute("INSERT INTO settings (key, value) VALUES ($1, $2)", "hide_matched", "1")
 
-    logger.info("Database tables initialized")
-
+        logger.info("Database tables initialized and patched")
 
 
 # ===================== МИГРАЦИЯ ИЗ SQLITE =====================
