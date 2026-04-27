@@ -333,9 +333,13 @@ async def init_db():
                 "INSERT INTO settings (key, value) VALUES ($1, $2)",
                 "hide_matched", "1",
             )
+        await conn.execute("""
+                    ALTER TABLE story_participants 
+                    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+                """)
+
     logger.info("Database tables initialized")
-    await conn.execute(
-        "ALTER TABLE story_participants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
+
 
 
 # ===================== МИГРАЦИЯ ИЗ SQLITE =====================
