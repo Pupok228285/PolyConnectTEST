@@ -222,6 +222,12 @@ def can_use_story(tg_id: int) -> bool:
 
 async def init_db():
     async with pool.acquire() as conn:
+        # УДАЛЯЕМ ВСЁ СТАРОЕ ПО "БОЧКЕ"
+        await conn.execute("DROP TABLE IF EXISTS story_answers CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS story_participants CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS story_questions CASCADE;")
+
+        # ... дальше твой код создания таблиц ...
         # 1. Базовые таблицы
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
