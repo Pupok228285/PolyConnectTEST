@@ -1,7 +1,3 @@
-# ===================== main.py — ПОЛНОЕ ОБНОВЛЕНИЕ =====================
-# aiogram 3.x + PostgreSQL (asyncpg) + APScheduler (AsyncIOScheduler)
-# =====================================================================
-
 from aiogram.client.default import DefaultBotProperties
 import asyncio
 import logging
@@ -9,13 +5,13 @@ import random
 import html as html_module
 import json
 from typing import Optional
-from datetime import datetime, time as dtime, date
 
 import os
 import telebot
 from dotenv import load_dotenv
 
 import asyncpg
+from datetime import datetime, time
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command, StateFilter
@@ -39,7 +35,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 # ===================== НАСТРОЙКИ =====================
 
-# load_dotenv()
+load_dotenv()
 
 API_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 COMPLAINT_BOT_TOKEN = os.getenv("HELPER_BOT_TOKEN")
@@ -53,33 +49,25 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 
 # Путь к старой SQLite-базе (для миграции)
 if os.path.exists("/app/data"):
-    SQLITE_DB_PATH = "/app/data/dating_bottest.db"
+    SQLITE_DB_PATH = "/app/data/dating_bot.db"
 else:
-    SQLITE_DB_PATH = "dating_bottest.db"
+    SQLITE_DB_PATH = "dating_bot.db"
 
 ADMIN_IDS = {1056843400, 5002429263}
 SUPPORT_USERNAME = "@hekomar"
 HIDE_MATCHED_PROFILES = True
 
 # === LIKE MESSAGE === Управление доступом
+# Вписывай сюда Telegram ID пользователей, которым доступна кнопка 💌
 ALLOWED_SENDER_IDS: list[int] = []
+# Если True — кнопка 💌 доступна ВСЕМ пользователям
 ALLOW_MESSAGES_FOR_ALL: bool = True
 
-# ===================== НОВАЯ КОНФИГУРАЦИЯ ФИЧ =====================
-ALLOW_NETWORKING_ALL = True        # Гео-нетворкинг — рассылка всем
-ALLOW_STORY_ALL = True             # Игра «Бочка» — рассылка всем
-REVEAL_STORIES = True              # Раскрыть истории всем (тумблер админа)
-TESTER_IDS = [1056843400, 5002429263]  # ID тестировщиков
-
-# Корпуса для гео-нетворкинга
-CAMPUS_BUILDINGS = [
-    ("main", "Главный корпус"),
-    ("bibl", "Библиотека"),
-    ("teh",  "Технический корпус"),
-    ("gum",  "Гуманитарный корпус"),
-    ("sport", "Спортивный корпус"),
-    ("nope", "Сегодня не в универе"),
-]
+# ===================== КОНФИГУРАЦИЯ ТЕСТИРОВАНИЯ =====================
+ALLOW_NETWORKING_ALL = False   # Если False — гео-нетворкинг только для TESTER_IDS
+ALLOW_STORY_ALL = False        # Если False — «Бочка» только для TESTER_IDS
+TESTER_IDS = [1056843400, 5002429263, 1097274747]  # ID тестировщиков
+REVEAL_STORIES = False         # Глобальный флаг для открытия ответов в "Бочке"
 
 # ===================== БОТ ДЛЯ ЖАЛОБ =====================
 COMPLAINT_CHAT_ID = 1056843400
@@ -127,8 +115,8 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Глобальный планировщик
-scheduler: Optional[AsyncIOScheduler] = None
+# ===================== SCHEDULER =====================
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 # ===================== FSM STATES =====================
 
@@ -155,6 +143,10 @@ class BroadcastForm(StatesGroup):
     waiting_message = State()
 
 
+class CopyBroadcastForm(StatesGroup):
+    waiting_forward = State()
+
+
 class BlacklistForm(StatesGroup):
     waiting_id = State()
 
@@ -168,10 +160,14 @@ class UserStates(StatesGroup):
     waiting_for_like_message = State()
 
 
-# === STORY === Состояние ожидания ответа на вопрос недели
+# === STORY === Состояние для ввода ответа на вопрос «Бочки»
 class StoryStates(StatesGroup):
-    waiting_answer = State()         # обычный ответ на сегодняшний вопрос
-    waiting_answer_missed = State()  # ответ на пропущенный вчерашний вопрос
+    waiting_answer = State()
+
+
+# === STORY ADMIN === Состояние для ввода вопроса «Бочки»
+class StoryAdminStates(StatesGroup):
+    waiting_question = State()
 
 
 # ===================== IN-MEMORY STORES =====================
@@ -179,8 +175,12 @@ class StoryStates(StatesGroup):
 current_targets: dict[int, int] = {}
 user_queues: dict[int, list[int]] = {}
 
-# === RETURN === Сохранённые target_id при переходе во «Входящие лайки»
-saved_browse_targets: dict[int, int] = {}
+# === GEO NETWORKING === Хранилище отправленных сообщений с вопросом о корпусе
+# {tg_id: message_id} — чтобы можно было edit/delete
+geo_question_messages: dict[int, int] = {}
+
+# === ЗАДАЧА 3 === Хранилище позиции в ленте для возврата после входящих
+user_browse_position: dict[int, int] = {}  # tg_id -> target_tg_id (последняя анкета в ленте)
 
 # ===================== ГЛОБАЛЬНЫЙ ПУЛ ASYNCPG =====================
 
@@ -199,6 +199,22 @@ async def create_pool():
         max_size=10,
     )
     logger.info("PostgreSQL connection pool created")
+
+
+# ===================== ACCESS HELPERS =====================
+
+def can_use_networking(tg_id: int) -> bool:
+    """Проверяет доступ к гео-нетворкингу."""
+    if ALLOW_NETWORKING_ALL:
+        return True
+    return tg_id in TESTER_IDS
+
+
+def can_use_story(tg_id: int) -> bool:
+    """Проверяет доступ к игре «Бочка»."""
+    if ALLOW_STORY_ALL:
+        return True
+    return tg_id in TESTER_IDS
 
 
 # ===================== DATABASE — INIT =====================
@@ -267,62 +283,50 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
-        # === NETWORKING === Гео-нетворкинг: ответы пользователей о корпусе
+        # === GEO NETWORKING === Таблица для хранения выборов локации
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS networking_answers (
+            CREATE TABLE IF NOT EXISTS geo_locations (
                 id SERIAL PRIMARY KEY,
                 tg_id BIGINT NOT NULL,
-                day DATE NOT NULL,
-                building TEXT,
-                meet INTEGER DEFAULT 0,
+                campus TEXT NOT NULL,
+                wants_meet BOOLEAN NOT NULL DEFAULT FALSE,
+                date DATE NOT NULL DEFAULT CURRENT_DATE,
                 created_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(tg_id, day)
+                UNIQUE(tg_id, date)
             );
         """)
-        # === STORY === Игра «Бочка»: вопросы, ответы, участники
+        # === STORY (БОЧКА) === Таблица для хранения вопросов
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS story_questions (
                 id SERIAL PRIMARY KEY,
-                day_of_week INTEGER NOT NULL,  -- 0=Пн ... 6=Вс
-                question TEXT NOT NULL,
+                question_text TEXT NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                week_start DATE NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
+        # === STORY (БОЧКА) === Таблица для хранения ответов юзеров
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS story_answers (
                 id SERIAL PRIMARY KEY,
                 tg_id BIGINT NOT NULL,
-                day_of_week INTEGER NOT NULL,
-                question_id INTEGER,
-                answer TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
+                question_id INTEGER NOT NULL REFERENCES story_questions(id) ON DELETE CASCADE,
+                answer_text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(tg_id, question_id)
             );
         """)
+        # === STORY (БОЧКА) === Таблица активных участников недели
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS story_participants (
                 id SERIAL PRIMARY KEY,
-                tg_id BIGINT UNIQUE NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',  -- active / inactive
-                joined_at TIMESTAMP DEFAULT NOW()
+                tg_id BIGINT NOT NULL,
+                week_start DATE NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(tg_id, week_start)
             );
         """)
-
-        # Засеять стандартные вопросы недели, если таблица пуста
-        cnt = await conn.fetchval("SELECT COUNT(*) FROM story_questions")
-        if cnt == 0:
-            default_questions = [
-                (0, "Как ты себя чувствуешь в это утро понедельника?"),
-                (1, "Что хорошего случилось сегодня?"),
-                (2, "О чём ты мечтал(а) в детстве?"),
-                (3, "Какое у тебя сейчас настроение и почему?"),
-                (4, "Как прошла твоя неделя?"),
-            ]
-            for dow, q in default_questions:
-                await conn.execute(
-                    "INSERT INTO story_questions (day_of_week, question) VALUES ($1, $2)",
-                    dow, q,
-                )
-
         row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", "hide_matched")
         if row is None:
             await conn.execute(
@@ -367,7 +371,7 @@ async def migrate_from_sqlite():
                 r.get("tg_id"), r.get("tg_username"), r.get("username"),
                 r.get("photo_file_id"), r.get("gender"), r.get("age"),
                 r.get("faculty"), r.get("about"), r.get("is_active"),
-                r.get("looking_for"),
+                r.get("looking_for")
             )
     logger.info(f"Migrated {len(rows)} users with current timestamp")
 
@@ -406,7 +410,7 @@ async def migrate_from_sqlite():
                 new_viewer,
                 new_target,
                 r.get("is_like", 0),
-                r.get("viewed_in_incoming", 0),
+                r.get("viewed_in_incoming", 0)
             )
             migrated_swipes += 1
         logger.info(f"Migrated {migrated_swipes} swipes")
@@ -684,19 +688,6 @@ async def get_next_profile_for_view(viewer_tg_id: int) -> Optional[dict]:
     return dict(row)
 
 
-async def get_profile_by_db_id(db_id: int) -> Optional[dict]:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, tg_id, username, age, gender, looking_for,
-                   faculty, about, photo_file_id
-            FROM users WHERE id=$1
-            """,
-            db_id,
-        )
-    return dict(row) if row else None
-
-
 async def get_incoming_likes_count(viewer_tg_id: int) -> int:
     viewer_db_id = await get_user_db_id(viewer_tg_id)
     if viewer_db_id is None:
@@ -834,6 +825,60 @@ async def get_all_user_tg_ids() -> list[int]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT tg_id FROM users WHERE tg_id IS NOT NULL")
     return [r["tg_id"] for r in rows]
+
+
+# ===================== STORY (БОЧКА) — DB HELPERS =====================
+
+def get_current_week_start() -> datetime:
+    """Возвращает дату понедельника текущей недели."""
+    from datetime import date, timedelta
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    return monday
+
+
+async def get_story_text_for_user(tg_id: int, viewer_tg_id: int) -> Optional[str]:
+    """
+    Возвращает собранный текст истории юзера за текущую неделю.
+    Учитывает REVEAL_STORIES и принадлежность.
+    """
+    global REVEAL_STORIES
+    week_start = get_current_week_start()
+
+    async with pool.acquire() as conn:
+        # Проверяем, является ли юзер участником
+        participant = await conn.fetchrow(
+            "SELECT is_active FROM story_participants WHERE tg_id=$1 AND week_start=$2",
+            tg_id, week_start,
+        )
+        if not participant or not participant["is_active"]:
+            return None
+
+        # Получаем все ответы юзера за эту неделю
+        rows = await conn.fetch(
+            """
+            SELECT sa.answer_text FROM story_answers sa
+            JOIN story_questions sq ON sq.id = sa.question_id
+            WHERE sa.tg_id=$1 AND sq.week_start=$2
+            ORDER BY sq.day_of_week ASC
+            """,
+            tg_id, week_start,
+        )
+
+    if not rows:
+        return None
+
+    combined = " ".join(r["answer_text"] for r in rows)
+
+    if REVEAL_STORIES:
+        # Все видят полный текст в виде блока кода
+        return f"<pre>{html_module.escape(combined)}</pre>"
+    else:
+        # Юзер видит свой текст, остальные видят блок с *****
+        if viewer_tg_id == tg_id:
+            return f"<pre>{html_module.escape(combined)}</pre>"
+        else:
+            return "🔐 <pre>*****</pre>"
 
 
 # ===================== COMPLAINT HELPER =====================
@@ -1002,9 +1047,9 @@ def admin_menu_kb() -> dict:
         "keyboard": [
             [{"text": "Топ-10 анкет"}],
             [{"text": "Чёрный список"}],
-            [{"text": "Рассылка"}],
+            [{"text": "Рассылка"}, {"text": "📨 Копи-рассылка"}],
             [{"text": "Тумблер мэтча"}],
-            [{"text": "🛑 Стоп вопросов"}],
+            [{"text": "🎮 Игра Бочка"}],
             [{"text": "Выйти из админки"}],
         ],
         "resize_keyboard": True,
@@ -1022,38 +1067,15 @@ def blacklist_menu_kb() -> dict:
     }
 
 
-# === NETWORKING === Inline-клавиатуры для гео-нетворкинга
-def networking_buildings_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for code, label in CAMPUS_BUILDINGS:
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"net_b_{code}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def networking_meet_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да", callback_data="net_m_yes"),
-            InlineKeyboardButton(text="❌ Нет", callback_data="net_m_no"),
-        ]
-    ])
-
-
-# === STORY === Inline-клавиатуры для игры «Бочка»
-def story_first_day_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✏️ Ответить", callback_data="story_join"),
-            InlineKeyboardButton(text="🚫 Не участвовать", callback_data="story_skip"),
-        ]
-    ])
-
-
-def story_answer_kb(missed: bool = False) -> InlineKeyboardMarkup:
-    cb = "story_answer_missed" if missed else "story_answer"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Ответить", callback_data=cb)]
-    ])
+def story_admin_menu_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "📢 Предупредить"}, {"text": "❓ Написать вопрос"}],
+            [{"text": "🛑 Стоп вопросов"}, {"text": "⚙️ Тумблер"}],
+            [{"text": "Назад в админку"}],
+        ],
+        "resize_keyboard": True,
+    }
 
 
 async def send_with_custom_kb(chat_id: int, text: str, keyboard_dict: dict, **kwargs):
@@ -1111,46 +1133,7 @@ def get_clickable_username(user: dict) -> str:
     return f'<a href="tg://user?id={tg_id}">профиль</a>'
 
 
-# === STORY === Получить ответы пользователя на story-вопросы (по дням недели)
-async def get_user_story_answers(tg_id: int) -> list[dict]:
-    """Возвращает список словарей {day_of_week, answer} отсортированных по дню недели."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT day_of_week, answer
-            FROM story_answers
-            WHERE tg_id=$1
-            ORDER BY day_of_week ASC, id ASC
-            """,
-            tg_id,
-        )
-    return [dict(r) for r in rows]
-
-
-def _format_story_block(answers: list[dict], reveal: bool, owner_view: bool) -> str:
-    """
-    Формирует блок '✨ История недели' для анкеты.
-    - reveal=True: всем видны ответы без троеточия, в кавычках «».
-    - reveal=False, owner_view=True: владелец видит свои ответы с троеточием.
-    - reveal=False, owner_view=False: остальные видят 🔐 *****.
-    """
-    header = "✨ <b>История недели:</b>\n"
-    if reveal:
-        if not answers:
-            return ""
-        text = " ".join(html_module.escape(a["answer"]) for a in answers)
-        return header + f"<blockquote>«{text}»</blockquote>"
-    else:
-        if owner_view:
-            if not answers:
-                return ""
-            text = " ".join(html_module.escape(a["answer"]) for a in answers)
-            return header + f"<blockquote>«{text}»</blockquote>..."
-        else:
-            return header + f'<blockquote>«🔐 <code>*****</code>»</blockquote>'
-
-
-def format_profile_text(user: dict, show_status: bool = False, story_block: str = "") -> str:
+def format_profile_text(user: dict, show_status: bool = False, viewer_tg_id: int = 0) -> str:
     username = user.get("username", "—")
     age = user.get("age", "?")
     faculty = user.get("faculty")
@@ -1182,37 +1165,62 @@ def format_profile_text(user: dict, show_status: bool = False, story_block: str 
         text += f"\n\n🟢 Включить анкету — /activate"
         text += f"\n🔴 Выключить анкету — /deactivate"
 
-    # === STORY === Блок истории недели в самом низу
-    if story_block:
-        text += "\n\n" + story_block
+    # === ЗАДАЧА 2: Блок «История недели» в самом низу ===
+    profile_tg_id = user.get("tg_id", 0)
+    # Используем _story_cache если есть (заполняется при async-вызове)
+    story_text = user.get("_story_text")
+    if story_text:
+        text += f"\n\n✨ История недели:\n{story_text}"
 
     return text
 
 
-async def build_story_block_for(target_user: dict, viewer_tg_id: Optional[int]) -> str:
-    """Формирует блок '✨ История недели' для конкретной пары (просмотрщик, владелец анкеты)."""
-    target_tg_id = target_user.get("tg_id")
-    if not target_tg_id:
-        return ""
-    answers = await get_user_story_answers(target_tg_id)
-    # Если у пользователя нет ответов и reveal=False — проверяем, является ли он участником
-    if not answers and not REVEAL_STORIES:
-        participant = await get_story_participant(target_tg_id)
-        if not participant or participant["status"] != "active":
-            return ""
-    owner_view = (viewer_tg_id is not None and viewer_tg_id == target_tg_id)
-    return _format_story_block(answers, reveal=REVEAL_STORIES, owner_view=owner_view)
+async def format_profile_text_async(user: dict, show_status: bool = False, viewer_tg_id: int = 0) -> str:
+    """Асинхронная версия format_profile_text с подгрузкой Story."""
+    profile_tg_id = user.get("tg_id", 0)
+    if profile_tg_id and viewer_tg_id:
+        story_text = await get_story_text_for_user(profile_tg_id, viewer_tg_id)
+        if story_text:
+            user = dict(user)  # копия
+            user["_story_text"] = story_text
+    return format_profile_text(user, show_status=show_status, viewer_tg_id=viewer_tg_id)
 
 
-async def send_profile_card(chat_id: int, user: dict, keyboard_dict: dict, show_status: bool = False, viewer_tg_id: Optional[int] = None):
-    story_block = await build_story_block_for(user, viewer_tg_id if viewer_tg_id is not None else chat_id)
-    text = format_profile_text(user, show_status=show_status, story_block=story_block)
+async def send_profile_card(chat_id: int, user: dict, keyboard_dict: dict, show_status: bool = False, viewer_tg_id: int = 0):
+    text = await format_profile_text_async(user, show_status=show_status, viewer_tg_id=viewer_tg_id)
     photo_id = user.get("photo_file_id")
 
     if photo_id:
         await send_photo_with_custom_kb(chat_id, photo_id, text, keyboard_dict)
     else:
         await send_with_custom_kb(chat_id, text, keyboard_dict)
+
+
+# === ЗАДАЧА 3 === Отправка фото мэтча партнёру при Match
+async def send_match_photo(to_tg_id: int, partner_user: dict, extra_text: str = ""):
+    """Отправляет send_photo партнёра с текстом поздравления при Match."""
+    photo_id = partner_user.get("photo_file_id")
+    partner_link = get_clickable_username(partner_user)
+    caption = f"🎉 <b>У вас взаимная симпатия!</b>\n\nНапиши: {partner_link}"
+    if extra_text:
+        caption += f"\n\n{extra_text}"
+
+    try:
+        if photo_id:
+            await bot.send_photo(
+                to_tg_id,
+                photo=photo_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await bot.send_message(
+                to_tg_id,
+                caption,
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        logger.error(f"Failed to send match photo to {to_tg_id}: {e}")
 
 
 def main_menu_text(has_profile_flag: bool = True) -> str:
@@ -1251,6 +1259,561 @@ async def check_blacklist(message: Message) -> bool:
         await message.answer("🔒 <b>Вы в чёрном списке.</b>")
         return True
     return False
+
+
+# ===================== GEO NETWORKING — SCHEDULER JOBS =====================
+
+# Корпуса для inline-кнопок
+GEO_CAMPUSES = [
+    "Семёновская", "Автозаводская", "П. Корчагина",
+    "Прянишникова", "Лефортовский вал", "1-я Дубровская",
+]
+
+
+async def geo_send_question():
+    """Рассылка вопроса 'В каком ты сегодня корпусе?' в 12:10 (Пн-Сб)."""
+    logger.info("GEO NETWORKING: Sending campus question...")
+
+    all_ids = await get_all_user_tg_ids()
+
+    buttons = []
+    row = []
+    for campus in GEO_CAMPUSES:
+        row.append(InlineKeyboardButton(text=campus, callback_data=f"geo_campus_{campus}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="🙈 Игнорировать", callback_data="geo_campus_ignore")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    for tg_id in all_ids:
+        if not can_use_networking(tg_id):
+            continue
+        if not await has_profile(tg_id):
+            continue
+        try:
+            msg = await bot.send_message(
+                tg_id,
+                "📍 <b>В каком ты сегодня корпусе?</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+            geo_question_messages[tg_id] = msg.message_id
+        except Exception as e:
+            logger.error(f"GEO: Failed to send question to {tg_id}: {e}")
+        await asyncio.sleep(0.05)
+
+
+async def geo_send_results():
+    """Рассылка контактов в 13:20 (Пн-Сб). Юзеры без ответа — удаляем вопрос."""
+    logger.info("GEO NETWORKING: Sending results...")
+    from datetime import date
+    today = date.today()
+
+    # Удаляем сообщения у тех, кто не ответил
+    for tg_id, msg_id in list(geo_question_messages.items()):
+        try:
+            await bot.delete_message(tg_id, msg_id)
+        except Exception:
+            pass
+    geo_question_messages.clear()
+
+    # Собираем ответивших по корпусам
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT tg_id, campus FROM geo_locations WHERE date=$1 AND wants_meet=TRUE",
+            today,
+        )
+
+    # Группируем по корпусу
+    campus_groups: dict[str, list[int]] = {}
+    for r in rows:
+        campus = r["campus"]
+        tg_id = r["tg_id"]
+        if campus not in campus_groups:
+            campus_groups[campus] = []
+        campus_groups[campus].append(tg_id)
+
+    # Рассылаем контакты
+    for campus, tg_ids in campus_groups.items():
+        if len(tg_ids) < 2:
+            # Если один — сообщаем что никого нет
+            for tg_id in tg_ids:
+                try:
+                    await bot.send_message(
+                        tg_id,
+                        f"📍 <b>{html_module.escape(campus)}</b>\n\n"
+                        f"К сожалению, больше никто не выбрал этот корпус сегодня 😔",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            continue
+
+        # Получаем usernames
+        user_infos = {}
+        for tg_id in tg_ids:
+            user = await get_user_by_tg_id(tg_id)
+            if user:
+                user_infos[tg_id] = user
+
+        for tg_id in tg_ids:
+            # Список контактов — все, кроме самого юзера
+            contacts = []
+            for other_tg_id in tg_ids:
+                if other_tg_id == tg_id:
+                    continue
+                other_user = user_infos.get(other_tg_id)
+                if other_user:
+                    contacts.append(get_clickable_username(other_user))
+
+            if contacts:
+                contacts_text = "\n".join(f"• {c}" for c in contacts)
+                try:
+                    await bot.send_message(
+                        tg_id,
+                        f"📍 <b>{html_module.escape(campus)}</b> — стыкуемся в холле!\n\n"
+                        f"Ребята, которые тоже хотят встретиться:\n{contacts_text}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as e:
+                    logger.error(f"GEO: Failed to send results to {tg_id}: {e}")
+            await asyncio.sleep(0.05)
+
+
+# === GEO CALLBACKS ===
+
+@router.callback_query(F.data.startswith("geo_campus_"))
+async def handle_geo_campus(callback: CallbackQuery):
+    """Обработка выбора корпуса."""
+    await callback.answer()
+    tg_id = callback.from_user.id
+    data = callback.data.replace("geo_campus_", "")
+
+    # Удаляем из ожидающих
+    geo_question_messages.pop(tg_id, None)
+
+    if data == "ignore":
+        try:
+            await callback.message.edit_text(
+                "📍 Ты решил пропустить нетворкинг сегодня. До завтра! 👋",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    campus = data
+    from datetime import date
+    today = date.today()
+
+    # Сохраняем выбор корпуса
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO geo_locations (tg_id, campus, wants_meet, date)
+            VALUES ($1, $2, FALSE, $3)
+            ON CONFLICT (tg_id, date) DO UPDATE SET campus=EXCLUDED.campus, wants_meet=FALSE
+            """,
+            tg_id, campus, today,
+        )
+
+    # Редактируем сообщение — спрашиваем о встрече
+    meet_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да", callback_data=f"geo_meet_yes_{campus}"),
+                InlineKeyboardButton(text="❌ Нет", callback_data=f"geo_meet_no_{campus}"),
+            ]
+        ]
+    )
+
+    try:
+        await callback.message.edit_text(
+            f"📍 Корпус: <b>{html_module.escape(campus)}</b>\n\n"
+            f"Стыкуемся в холле на перемене?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=meet_kb,
+        )
+    except Exception as e:
+        logger.error(f"GEO: Failed to edit message for {tg_id}: {e}")
+
+
+@router.callback_query(F.data.startswith("geo_meet_"))
+async def handle_geo_meet(callback: CallbackQuery):
+    """Обработка ответа Да/Нет на встречу."""
+    await callback.answer()
+    tg_id = callback.from_user.id
+    data = callback.data  # geo_meet_yes_CampusName or geo_meet_no_CampusName
+
+    if data.startswith("geo_meet_yes_"):
+        campus = data.replace("geo_meet_yes_", "")
+        wants_meet = True
+    elif data.startswith("geo_meet_no_"):
+        campus = data.replace("geo_meet_no_", "")
+        wants_meet = False
+    else:
+        return
+
+    from datetime import date
+    today = date.today()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE geo_locations SET wants_meet=$1
+            WHERE tg_id=$2 AND date=$3
+            """,
+            wants_meet, tg_id, today,
+        )
+
+    if wants_meet:
+        try:
+            await callback.message.edit_text(
+                f"📍 <b>{html_module.escape(campus)}</b> — Отлично! ✅\n\n"
+                f"В 13:20 ты получишь контакты ребят из твоего корпуса.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await callback.message.edit_text(
+                f"📍 <b>{html_module.escape(campus)}</b> — Понял, в другой раз! 👋",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+
+# ===================== STORY (БОЧКА) — ADMIN HANDLERS =====================
+
+@router.message(F.text == "🎮 Игра Бочка")
+async def admin_story_menu(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    global REVEAL_STORIES, ALLOW_STORY_ALL
+    status = (
+        f"🎮 <b>Игра «Бочка» — Админка</b>\n\n"
+        f"REVEAL_STORIES: <b>{'✅ Открыто' if REVEAL_STORIES else '❌ Скрыто'}</b>\n"
+        f"ALLOW_STORY_ALL: <b>{'✅ Для всех' if ALLOW_STORY_ALL else '🔒 Только тестеры'}</b>"
+    )
+    await send_with_custom_kb(message.chat.id, status, story_admin_menu_kb())
+
+
+@router.message(F.text == "📢 Предупредить")
+async def admin_story_announce(message: Message, state: FSMContext):
+    """Рассылает анонс игры всем (или тестерам)."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    all_ids = await get_all_user_tg_ids()
+    count = 0
+    for tg_id in all_ids:
+        if not can_use_story(tg_id):
+            continue
+        if not await has_profile(tg_id):
+            continue
+        try:
+            await bot.send_message(
+                tg_id,
+                "🎮 <b>Игра «Бочка» (Story of the Week)</b>\n\n"
+                "На этой неделе запускается «Бочка»! "
+                "Каждый день (Пн–Чт) тебе придёт вопрос. "
+                "Ответь — и твои ответы появятся в анкете.\n\n"
+                "⚠️ Если пропустишь первый вопрос в понедельник — не сможешь участвовать до следующей недели!",
+                parse_mode=ParseMode.HTML,
+            )
+            count += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+    await send_with_custom_kb(
+        message.chat.id,
+        f"📢 Анонс отправлен <b>{count}</b> юзерам.",
+        story_admin_menu_kb(),
+    )
+
+
+@router.message(F.text == "❓ Написать вопрос")
+async def admin_story_write_question(message: Message, state: FSMContext):
+    """Переводит админа в режим ввода вопроса."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(StoryAdminStates.waiting_question)
+    await message.answer(
+        "❓ <b>Напиши текст вопроса для «Бочки».</b>\n\n"
+        "⚠️ Если сегодня понедельник — все старые истории будут обнулены.\n\n"
+        "Для отмены: /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("cancel"), StoryAdminStates.waiting_question)
+async def cancel_story_question(message: Message, state: FSMContext):
+    await state.clear()
+    await send_with_custom_kb(message.chat.id, "❌ Отменено.", story_admin_menu_kb())
+
+
+@router.message(StoryAdminStates.waiting_question, F.text)
+async def process_story_question(message: Message, state: FSMContext):
+    """Сохраняет вопрос и рассылает участникам."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+
+    global REVEAL_STORIES
+    question_text = message.text.strip()
+    if not question_text:
+        await send_with_custom_kb(message.chat.id, "❌ Вопрос пустой.", story_admin_menu_kb())
+        return
+
+    from datetime import date, timedelta
+    today = date.today()
+    day_of_week = today.weekday()  # 0=Пн, 1=Вт, ...
+    week_start = today - timedelta(days=day_of_week)
+
+    async with pool.acquire() as conn:
+        # Если понедельник — обнуляем всё
+        if day_of_week == 0:
+            REVEAL_STORIES = False
+            await conn.execute(
+                "DELETE FROM story_answers WHERE question_id IN (SELECT id FROM story_questions WHERE week_start=$1)",
+                week_start,
+            )
+            await conn.execute("DELETE FROM story_questions WHERE week_start=$1", week_start)
+            await conn.execute("DELETE FROM story_participants WHERE week_start=$1", week_start)
+            logger.info("STORY: Monday reset — cleared old stories")
+
+        # Сохраняем вопрос
+        row = await conn.fetchrow(
+            """
+            INSERT INTO story_questions (question_text, day_of_week, week_start)
+            VALUES ($1, $2, $3) RETURNING id
+            """,
+            question_text, day_of_week, week_start,
+        )
+        question_id = row["id"]
+
+    # Определяем кому отправлять
+    all_ids = await get_all_user_tg_ids()
+    count = 0
+
+    for tg_id in all_ids:
+        if not can_use_story(tg_id):
+            continue
+        if not await has_profile(tg_id):
+            continue
+
+        async with pool.acquire() as conn:
+            if day_of_week == 0:
+                # Понедельник — отправляем всем, кто может
+                pass
+            else:
+                # Вт-Чт — только активным участникам
+                participant = await conn.fetchrow(
+                    "SELECT is_active FROM story_participants WHERE tg_id=$1 AND week_start=$2",
+                    tg_id, week_start,
+                )
+                if not participant or not participant["is_active"]:
+                    continue
+
+        # Собираем предыдущие ответы юзера для контекста (Вт-Чт)
+        context_text = ""
+        if day_of_week > 0:
+            async with pool.acquire() as conn:
+                prev_answers = await conn.fetch(
+                    """
+                    SELECT sa.answer_text FROM story_answers sa
+                    JOIN story_questions sq ON sq.id = sa.question_id
+                    WHERE sa.tg_id=$1 AND sq.week_start=$2
+                    ORDER BY sq.day_of_week ASC
+                    """,
+                    tg_id, week_start,
+                )
+            if prev_answers:
+                prev_texts = [f'«{r["answer_text"]}»' for r in prev_answers]
+                context_text = "\n\n📝 Твои предыдущие ответы:\n" + "\n".join(prev_texts)
+
+        # Inline-кнопки: Ответить / Не отвечать
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✍️ Ответить", callback_data=f"story_answer_{question_id}"),
+                    InlineKeyboardButton(text="🚫 Не отвечать", callback_data=f"story_skip_{question_id}"),
+                ]
+            ]
+        )
+
+        try:
+            await bot.send_message(
+                tg_id,
+                f"🎮 <b>Бочка — Вопрос дня:</b>\n\n"
+                f"❓ {html_module.escape(question_text)}{context_text}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+            count += 1
+        except Exception as e:
+            logger.error(f"STORY: Failed to send question to {tg_id}: {e}")
+        await asyncio.sleep(0.05)
+
+    await send_with_custom_kb(
+        message.chat.id,
+        f"✅ Вопрос отправлен <b>{count}</b> юзерам.\n\n"
+        f"День: {['Пн','Вт','Ср','Чт','Пт','Сб','Вс'][day_of_week]}",
+        story_admin_menu_kb(),
+    )
+
+
+@router.message(F.text == "🛑 Стоп вопросов")
+async def admin_story_stop(message: Message, state: FSMContext):
+    """Открывает ответы — REVEAL_STORIES = True."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    global REVEAL_STORIES
+    REVEAL_STORIES = True
+    await send_with_custom_kb(
+        message.chat.id,
+        "🛑 <b>REVEAL_STORIES = True</b>\n\nТеперь все видят полные ответы в анкетах.",
+        story_admin_menu_kb(),
+    )
+
+
+@router.message(F.text == "⚙️ Тумблер")
+async def admin_story_toggle(message: Message, state: FSMContext):
+    """Переключает ALLOW_STORY_ALL."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    global ALLOW_STORY_ALL
+    ALLOW_STORY_ALL = not ALLOW_STORY_ALL
+    status = "✅ Для всех" if ALLOW_STORY_ALL else "🔒 Только тестеры"
+    await send_with_custom_kb(
+        message.chat.id,
+        f"⚙️ <b>ALLOW_STORY_ALL = {ALLOW_STORY_ALL}</b>\n\nДоступ к «Бочке»: {status}",
+        story_admin_menu_kb(),
+    )
+
+
+# === STORY CALLBACKS ===
+
+@router.callback_query(F.data.startswith("story_answer_"))
+async def handle_story_answer_btn(callback: CallbackQuery, state: FSMContext):
+    """Юзер нажал 'Ответить' — переводим в режим ввода текста."""
+    await callback.answer()
+    tg_id = callback.from_user.id
+    question_id_str = callback.data.replace("story_answer_", "")
+
+    try:
+        question_id = int(question_id_str)
+    except ValueError:
+        return
+
+    from datetime import date, timedelta
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+
+    # Регистрируем как участника если понедельник и ещё не зарегистрирован
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO story_participants (tg_id, week_start, is_active)
+            VALUES ($1, $2, TRUE)
+            ON CONFLICT (tg_id, week_start) DO NOTHING
+            """,
+            tg_id, week_start,
+        )
+
+    await state.update_data(story_question_id=question_id)
+    await state.set_state(StoryStates.waiting_answer)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await bot.send_message(
+        tg_id,
+        "✍️ <b>Напиши свой ответ:</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("story_skip_"))
+async def handle_story_skip_btn(callback: CallbackQuery):
+    """Юзер нажал 'Не отвечать'."""
+    await callback.answer()
+    tg_id = callback.from_user.id
+    question_id_str = callback.data.replace("story_skip_", "")
+
+    from datetime import date, timedelta
+    today = date.today()
+    day_of_week = today.weekday()
+    week_start = today - timedelta(days=day_of_week)
+
+    if day_of_week == 0:
+        # Понедельник — если пропустил, вылетает из игры
+        # Не регистрируем как участника — он просто не может участвовать
+        try:
+            await callback.message.edit_text(
+                "🚫 Ты пропустил первый вопрос. До следующей недели! 👋",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await callback.message.edit_text(
+                "🚫 Ты пропустил этот вопрос.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+
+@router.message(StoryStates.waiting_answer, F.text)
+async def process_story_answer(message: Message, state: FSMContext):
+    """Сохраняет ответ юзера на вопрос «Бочки»."""
+    tg_id = message.from_user.id
+    answer_text = message.text.strip()
+
+    if not answer_text:
+        await message.answer("❌ Ответ не может быть пустым.")
+        return
+
+    data = await state.get_data()
+    question_id = data.get("story_question_id")
+    await state.clear()
+
+    if not question_id:
+        await message.answer("❌ Ошибка. Попробуй заново.")
+        return
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO story_answers (tg_id, question_id, answer_text)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (tg_id, question_id) DO UPDATE SET answer_text=EXCLUDED.answer_text
+            """,
+            tg_id, question_id, answer_text,
+        )
+
+    await message.answer(
+        f"✅ <b>Ответ сохранён!</b>\n\n"
+        f"Твой ответ: «{html_module.escape(answer_text)}»",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(StoryStates.waiting_answer)
+async def process_story_answer_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Отправь <b>текст</b> ответа.")
 
 
 # ===================== /start =====================
@@ -1560,8 +2123,6 @@ async def my_profile_browse(message: Message, state: FSMContext):
 
     incoming_count = await get_incoming_likes_count(message.from_user.id)
     if incoming_count > 0:
-        # === RETURN === Сохраняем текущий target перед входом в «Входящие»
-        _save_browse_target(message.from_user.id)
         word = "человеку" if incoming_count == 1 else "людям"
         await send_with_custom_kb(
             message.chat.id,
@@ -1747,8 +2308,6 @@ async def browse_profiles(message: Message, state: FSMContext):
 
     incoming_count = await get_incoming_likes_count(message.from_user.id)
     if incoming_count > 0:
-        # === RETURN === Сохраняем текущий target перед входом в «Входящие»
-        _save_browse_target(message.from_user.id)
         word = "человеку" if incoming_count == 1 else "людям"
         await send_with_custom_kb(
             message.chat.id,
@@ -1757,58 +2316,74 @@ async def browse_profiles(message: Message, state: FSMContext):
         )
         return
 
-    # === RETURN === Если есть сохранённый target_id (после возврата из лайков) — показать его
-    saved_target = current_targets.get(message.from_user.id)
-    if saved_target:
-        target_user = await get_user_by_tg_id(saved_target)
-        if target_user and target_user.get("photo_file_id"):
-            show_msg_btn = can_send_like_message(message.from_user.id)
-            await send_profile_card(message.chat.id, target_user, browse_kb(show_message_button=show_msg_btn), viewer_tg_id=message.from_user.id)
-            return
-
     await show_random_profile(message)
 
 
-# === RETURN === Хелпер: сохранить текущий target при переходе в «Входящие лайки»
-def _save_browse_target(tg_id: int):
-    """Сохраняет current_targets[tg_id] в saved_browse_targets перед переходом в «Входящие»."""
-    target = current_targets.get(tg_id)
-    if target:
-        saved_browse_targets[tg_id] = target
-
-
-def _restore_browse_target(tg_id: int):
-    """Восстанавливает current_targets[tg_id] из saved_browse_targets после «Входящих»."""
-    saved = saved_browse_targets.pop(tg_id, None)
-    if saved:
-        current_targets[tg_id] = saved
-
-
 async def show_random_profile(message: Message):
-    profile = await get_next_profile_for_view(message.from_user.id)
+    tg_id = message.from_user.id
+
+    # === ЗАДАЧА 3: Умный возврат — если была сохранённая позиция, восстанавливаем ===
+    saved_target = user_browse_position.pop(tg_id, None)
+    if saved_target:
+        saved_user = await get_user_by_tg_id(saved_target)
+        if saved_user and saved_user.get("is_active") == 1:
+            current_targets[tg_id] = saved_target
+            show_msg_btn = can_send_like_message(tg_id)
+            await send_profile_card(message.chat.id, saved_user, browse_kb(show_message_button=show_msg_btn), viewer_tg_id=tg_id)
+            return
+
+    profile = await get_next_profile_for_view(tg_id)
     if not profile:
-        hp = await has_profile(message.from_user.id)
+        hp = await has_profile(tg_id)
         await send_with_custom_kb(
             message.chat.id,
             "❌ Пока нет подходящих анкет. Попробуй позже!",
             main_menu_kb(hp),
         )
-        current_targets.pop(message.from_user.id, None)
+        current_targets.pop(tg_id, None)
         return
 
-    current_targets[message.from_user.id] = profile["tg_id"]
-    show_msg_btn = can_send_like_message(message.from_user.id)
-    await send_profile_card(message.chat.id, profile, browse_kb(show_message_button=show_msg_btn), viewer_tg_id=message.from_user.id)
+    current_targets[tg_id] = profile["tg_id"]
+    # === LIKE MESSAGE === Показываем кнопку 💌 если у пользователя есть доступ
+    show_msg_btn = can_send_like_message(tg_id)
+    await send_profile_card(message.chat.id, profile, browse_kb(show_message_button=show_msg_btn), viewer_tg_id=tg_id)
 
 
 async def show_incoming_like_profile(message: Message):
-    profile = await get_one_incoming_like_profile(message.from_user.id)
+    tg_id = message.from_user.id
+
+    # === ЗАДАЧА 3: Сохраняем текущую позицию в ленте перед просмотром входящих ===
+    current_target = current_targets.get(tg_id)
+    if current_target and tg_id not in user_browse_position:
+        user_browse_position[tg_id] = current_target
+
+    profile = await get_one_incoming_like_profile(tg_id)
     if profile:
-        current_targets[message.from_user.id] = profile["tg_id"]
+        current_targets[tg_id] = profile["tg_id"]
 
-        remaining = await get_incoming_likes_count(message.from_user.id)
+        remaining = await get_incoming_likes_count(tg_id)
 
-        await send_profile_card(message.chat.id, profile, incoming_like_kb(), viewer_tg_id=message.from_user.id)
+        # Проверяем, есть ли 💌 сообщение от этого юзера
+        like_msg = None
+        async with pool.acquire() as conn:
+            like_msg = await conn.fetchrow(
+                """
+                SELECT content_type, file_id, text_content FROM like_messages
+                WHERE sender_tg_id=$1 AND target_tg_id=$2
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                profile["tg_id"], tg_id,
+            )
+
+        if like_msg:
+            # Сначала показываем 💌 сообщение
+            try:
+                await bot.send_message(tg_id, "💌 <b>К этому лайку есть сообщение:</b>", parse_mode=ParseMode.HTML)
+                await _send_like_media_to_target(tg_id, like_msg["content_type"], like_msg["file_id"], like_msg["text_content"])
+            except Exception:
+                pass
+
+        await send_profile_card(message.chat.id, profile, incoming_like_kb(), viewer_tg_id=tg_id)
 
         if remaining > 0:
             word = "анкета" if remaining == 1 else "анкет"
@@ -1818,17 +2393,7 @@ async def show_incoming_like_profile(message: Message):
                 incoming_like_kb(),
             )
     else:
-        # === RETURN === Все входящие лайки просмотрены — восстанавливаем target из ленты
-        _restore_browse_target(message.from_user.id)
-
-        saved_target = current_targets.get(message.from_user.id)
-        if saved_target:
-            target_user = await get_user_by_tg_id(saved_target)
-            if target_user and target_user.get("photo_file_id"):
-                show_msg_btn = can_send_like_message(message.from_user.id)
-                await send_profile_card(message.chat.id, target_user, browse_kb(show_message_button=show_msg_btn), viewer_tg_id=message.from_user.id)
-                return
-
+        # === ЗАДАЧА 3: Входящие закончились — возвращаемся к сохранённой анкете ===
         await show_random_profile(message)
 
 
@@ -1848,11 +2413,16 @@ async def view_incoming_likes(message: Message, state: FSMContext):
 
 @router.message(F.text == "💌")
 async def handle_like_message_button(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Обработчик кнопки 💌 — переводит пользователя в режим ввода сообщения к анкете.
+    """
     if await check_blacklist(message):
         return
 
     user_tg_id = message.from_user.id
 
+    # Проверка доступа
     if not can_send_like_message(user_tg_id):
         await message.answer("❌ Эта функция пока недоступна.")
         return
@@ -1864,6 +2434,7 @@ async def handle_like_message_button(message: Message, state: FSMContext):
         )
         return
 
+    # Сохраняем target_tg_id в FSM и переводим в состояние ожидания сообщения
     await state.update_data(like_message_target_tg_id=target_tg_id)
     await state.set_state(UserStates.waiting_for_like_message)
 
@@ -1877,11 +2448,16 @@ async def handle_like_message_button(message: Message, state: FSMContext):
 
 @router.message(Command("cancel"), UserStates.waiting_for_like_message)
 async def cancel_like_message(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Отмена ввода сообщения к лайку — возвращаем обратно к анкете.
+    """
     data = await state.get_data()
     target_tg_id = data.get("like_message_target_tg_id")
     await state.clear()
 
     if target_tg_id:
+        # Восстанавливаем current_target, чтобы пользователь мог продолжить листать
         current_targets[message.from_user.id] = target_tg_id
         target_user = await get_user_by_tg_id(target_tg_id)
         if target_user:
@@ -1897,6 +2473,11 @@ async def cancel_like_message(message: Message, state: FSMContext):
     F.content_type.in_({ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO, ContentType.VIDEO_NOTE})
 )
 async def process_like_message(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Принимает сообщение (текст/фото/видео/кружок), записывает лайк,
+    отправляет целевому пользователю сообщение + анкету отправителя с кнопками ❤️/💔.
+    """
     if await check_blacklist(message):
         return
 
@@ -1911,6 +2492,7 @@ async def process_like_message(message: Message, state: FSMContext):
         await show_main_menu(message)
         return
 
+    # Определяем тип контента и file_id
     content_type = message.content_type
     file_id = None
     text_content = None
@@ -1919,13 +2501,14 @@ async def process_like_message(message: Message, state: FSMContext):
         text_content = message.text
     elif content_type == ContentType.PHOTO:
         file_id = message.photo[-1].file_id
-        text_content = message.caption
+        text_content = message.caption  # может быть None
     elif content_type == ContentType.VIDEO:
         file_id = message.video.file_id
         text_content = message.caption
     elif content_type == ContentType.VIDEO_NOTE:
         file_id = message.video_note.file_id
 
+    # Сохраняем сообщение в БД
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -1935,18 +2518,19 @@ async def process_like_message(message: Message, state: FSMContext):
             user_tg_id, target_tg_id, content_type, file_id, text_content,
         )
 
+    # Записываем лайк (как обычный)
     mutual = await add_like(user_tg_id, target_tg_id)
 
     if mutual:
-        # === MATCH VISUAL === Отправляем фото партнёра + поздравление
+        # === ЗАДАЧА 3: Визуальный мэтч — send_photo партнёра ===
         user_a = await get_user_by_tg_id(user_tg_id)
         user_b = await get_user_by_tg_id(target_tg_id)
 
-        link_a = get_clickable_username(user_a) if user_a else "?"
-        link_b = get_clickable_username(user_b) if user_b else "?"
+        # Уведомляем отправителя с фото партнёра
+        if user_b:
+            await send_match_photo(user_tg_id, user_b, "<i>Сообщение было доставлено. Чтобы продолжить — нажми 1.</i>")
 
-        await _send_match_celebration(user_tg_id, user_b, link_b)
-
+        # Уведомляем получателя с фото отправителя
         try:
             await bot.send_message(
                 target_tg_id,
@@ -1954,29 +2538,33 @@ async def process_like_message(message: Message, state: FSMContext):
                 parse_mode=ParseMode.HTML,
             )
             await _send_like_media_to_target(target_tg_id, content_type, file_id, text_content)
-            await _send_match_celebration(target_tg_id, user_a, link_a)
+            if user_a:
+                await send_match_photo(target_tg_id, user_a)
         except Exception as e:
             logger.error(f"Failed to notify target {target_tg_id} about mutual match with message: {e}")
 
-        current_targets.pop(user_tg_id, None)
+        # Показываем главное меню отправителю
         await show_main_menu(message)
         return
 
-    # === Лайк НЕ взаимный — отправляем получателю сообщение + анкету отправителя ===
+    # === Лайк НЕ взаимный — отправляем получателю сообщение + анкету отправителя с InlineKeyboard ===
     sender_user = await get_user_by_tg_id(user_tg_id)
 
     try:
+        # 1) Заголовок
         await bot.send_message(
             target_tg_id,
             "💌 <b>Тебе прислали сообщение к анкете!</b>",
             parse_mode=ParseMode.HTML,
         )
 
+        # 2) Само сообщение пользователя
         await _send_like_media_to_target(target_tg_id, content_type, file_id, text_content)
 
+        # 3) Анкета отправителя с inline-кнопками ❤️ и 💔
         if sender_user:
-            story_block = await build_story_block_for(sender_user, target_tg_id)
-            profile_text = format_profile_text(sender_user, story_block=story_block)
+            profile_text = await format_profile_text_async(sender_user, viewer_tg_id=target_tg_id)
+            # Inline-кнопки: like_msg_SENDER_TG_ID  /  dislike_msg_SENDER_TG_ID
             inline_kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -2005,11 +2593,12 @@ async def process_like_message(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Failed to send like message to {target_tg_id}: {e}")
 
+    # Подтверждаем отправителю
     await message.answer("✅ <b>Сообщение отправлено!</b> Продолжаем листать анкеты...")
 
+    # Показываем следующую анкету
     incoming = await get_incoming_likes_count(user_tg_id)
     if incoming > 0:
-        _save_browse_target(user_tg_id)
         await show_incoming_like_profile(message)
     else:
         await show_random_profile(message)
@@ -2017,6 +2606,10 @@ async def process_like_message(message: Message, state: FSMContext):
 
 @router.message(UserStates.waiting_for_like_message)
 async def process_like_message_invalid(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Если пользователь отправил неподдерживаемый тип контента.
+    """
     await message.answer(
         "❌ Отправь <b>текст</b>, <b>фото</b>, <b>видео</b> или <b>кружок</b>.\n"
         "Для отмены: /cancel"
@@ -2025,6 +2618,7 @@ async def process_like_message_invalid(message: Message, state: FSMContext):
 
 # === LIKE MESSAGE === Хелпер для отправки медиа получателю
 async def _send_like_media_to_target(target_tg_id: int, content_type: str, file_id: Optional[str], text_content: Optional[str]):
+    """Отправляет само медиа-сообщение (текст/фото/видео/кружок) получателю."""
     try:
         if content_type == ContentType.TEXT and text_content:
             await bot.send_message(
@@ -2054,39 +2648,40 @@ async def _send_like_media_to_target(target_tg_id: int, content_type: str, file_
                 await bot.send_video(target_tg_id, video=file_id)
         elif content_type == ContentType.VIDEO_NOTE and file_id:
             await bot.send_video_note(target_tg_id, video_note=file_id)
+        # Обрабатываем строковые значения (из БД)
+        elif content_type == "text" and text_content:
+            await bot.send_message(
+                target_tg_id,
+                f"💬 {html_module.escape(text_content)}",
+                parse_mode=ParseMode.HTML,
+            )
+        elif content_type == "photo" and file_id:
+            if text_content:
+                await bot.send_photo(target_tg_id, photo=file_id, caption=f"💬 {html_module.escape(text_content)}", parse_mode=ParseMode.HTML)
+            else:
+                await bot.send_photo(target_tg_id, photo=file_id)
+        elif content_type == "video" and file_id:
+            if text_content:
+                await bot.send_video(target_tg_id, video=file_id, caption=f"💬 {html_module.escape(text_content)}", parse_mode=ParseMode.HTML)
+            else:
+                await bot.send_video(target_tg_id, video=file_id)
+        elif content_type == "video_note" and file_id:
+            await bot.send_video_note(target_tg_id, video_note=file_id)
     except Exception as e:
         logger.error(f"Failed to send like media to {target_tg_id}: {e}")
-
-
-# === MATCH VISUAL === Хелпер: визуальное поздравление с фото партнёра
-async def _send_match_celebration(chat_id: int, partner: Optional[dict], partner_link: str):
-    """Отправляет фото партнёра + поздравление + ссылку (для красивого мэтча)."""
-    if not partner:
-        return
-    caption = (
-        f"🎉 <b>У вас взаимная симпатия!</b>\n\n"
-        f"Лови ссылку: {partner_link}"
-    )
-    photo_id = partner.get("photo_file_id")
-    try:
-        if photo_id:
-            await bot.send_photo(chat_id, photo=photo_id, caption=caption, parse_mode=ParseMode.HTML)
-        else:
-            await bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Failed to send match celebration to {chat_id}: {e}")
-        try:
-            await bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
 
 
 # === LIKE MESSAGE === Inline callback: ❤️ ответный лайк на сообщение с анкетой
 @router.callback_query(F.data.startswith("like_msg_"))
 async def handle_like_msg_callback(callback: CallbackQuery, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Обработчик нажатия ❤️ под анкетой, пришедшей вместе с сообщением.
+    Засчитывает ответный лайк. Если мэтч — выдаёт контакты обоим.
+    """
     await callback.answer()
 
-    target_tg_id = callback.from_user.id
+    target_tg_id = callback.from_user.id  # тот, кто нажал ❤️ (получатель сообщения)
     sender_tg_id_str = callback.data.replace("like_msg_", "")
 
     try:
@@ -2094,26 +2689,20 @@ async def handle_like_msg_callback(callback: CallbackQuery, state: FSMContext):
     except ValueError:
         return
 
+    # Записываем ответный лайк
     mutual = await add_like(target_tg_id, sender_tg_id)
 
     if mutual:
         user_a = await get_user_by_tg_id(target_tg_id)
         user_b = await get_user_by_tg_id(sender_tg_id)
 
-        link_a = get_clickable_username(user_a) if user_a else "?"
-        link_b = get_clickable_username(user_b) if user_b else "?"
-
-        # === MATCH VISUAL ===
-        try:
-            await _send_match_celebration(target_tg_id, user_b, link_b)
-        except Exception as e:
-            logger.error(f"Failed to notify {target_tg_id} about match: {e}")
-
-        try:
-            await _send_match_celebration(sender_tg_id, user_a, link_a)
-        except Exception as e:
-            logger.error(f"Failed to notify sender {sender_tg_id} about match: {e}")
+        # === ЗАДАЧА 3: Визуальный мэтч — send_photo партнёра ===
+        if user_b:
+            await send_match_photo(target_tg_id, user_b)
+        if user_a:
+            await send_match_photo(sender_tg_id, user_a, "Твоё сообщение понравилось!")
     else:
+        # Не мэтч (лайк уже был, или первый ответный) — уведомим что лайк засчитан
         try:
             await bot.send_message(
                 target_tg_id,
@@ -2123,6 +2712,7 @@ async def handle_like_msg_callback(callback: CallbackQuery, state: FSMContext):
         except Exception:
             pass
 
+        # Уведомляем отправителя о входящем лайке
         sender_db_id = await get_user_db_id(sender_tg_id)
         if sender_db_id:
             async with pool.acquire() as conn:
@@ -2142,18 +2732,24 @@ async def handle_like_msg_callback(callback: CallbackQuery, state: FSMContext):
                 except Exception:
                     pass
 
+    # Убираем inline-кнопки с сообщения
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
 
-# === LIKE MESSAGE === Inline callback: 💔 ответный дизлайк
+# === LIKE MESSAGE === Inline callback: 💔 ответный дизлайк на сообщение с анкетой
 @router.callback_query(F.data.startswith("dislike_msg_"))
 async def handle_dislike_msg_callback(callback: CallbackQuery, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Обработчик нажатия 💔 под анкетой, пришедшей вместе с сообщением.
+    Засчитывает дизлайк.
+    """
     await callback.answer()
 
-    target_tg_id = callback.from_user.id
+    target_tg_id = callback.from_user.id  # тот, кто нажал 💔
     sender_tg_id_str = callback.data.replace("dislike_msg_", "")
 
     try:
@@ -2161,6 +2757,7 @@ async def handle_dislike_msg_callback(callback: CallbackQuery, state: FSMContext
     except ValueError:
         return
 
+    # Записываем дизлайк
     await add_dislike(target_tg_id, sender_tg_id)
 
     try:
@@ -2172,6 +2769,7 @@ async def handle_dislike_msg_callback(callback: CallbackQuery, state: FSMContext
     except Exception:
         pass
 
+    # Убираем inline-кнопки
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -2195,30 +2793,23 @@ async def handle_like(message: Message, state: FSMContext):
         )
         return
 
+    # Записываем лайк и проверяем на взаимность
     mutual = await add_like(user_tg_id, target_tg_id)
 
     if mutual:
         user_a = await get_user_by_tg_id(user_tg_id)
         user_b = await get_user_by_tg_id(target_tg_id)
 
-        link_a = get_clickable_username(user_a) if user_a else "?"
-        link_b = get_clickable_username(user_b) if user_b else "?"
+        # === ЗАДАЧА 3: Визуальный мэтч — send_photo партнёра ===
+        if user_b:
+            await send_match_photo(user_tg_id, user_b, "<i>Чтобы продолжить смотреть анкеты, нажми ❤️ еще раз.</i>")
+        if user_a:
+            await send_match_photo(target_tg_id, user_a)
 
-        # === MATCH VISUAL === Отправляем фото партнёра обоим
-        await _send_match_celebration(user_tg_id, user_b, link_b)
-
-        try:
-            await _send_match_celebration(target_tg_id, user_a, link_a)
-        except Exception:
-            pass
-
-        # Сбрасываем сохранённый target — мэтч закрыт
-        current_targets.pop(user_tg_id, None)
-        saved_browse_targets.pop(user_tg_id, None)
-        await show_main_menu(message)
         return
 
     else:
+        # Если лайк НЕ взаимный (просто уведомляем цель, если нужно)
         target_db_id = await get_user_db_id(target_tg_id)
         if target_db_id:
             async with pool.acquire() as conn:
@@ -2239,6 +2830,7 @@ async def handle_like(message: Message, state: FSMContext):
                 except Exception:
                     pass
 
+    # Если матча не было — листаем дальше автоматически
     incoming = await get_incoming_likes_count(user_tg_id)
     if incoming > 0:
         await show_incoming_like_profile(message)
@@ -2259,15 +2851,17 @@ async def handle_dislike(message: Message, state: FSMContext):
 
     if target_tg_id:
         await add_dislike(user_tg_id, target_tg_id)
-        # Дизлайк — сбрасываем target, чтобы при возврате не показать его снова
-        current_targets.pop(user_tg_id, None)
-        incoming = await get_incoming_likes_count(user_tg_id)
-        if incoming > 0:
-            await show_incoming_like_profile(message)
-        else:
-            await show_random_profile(message)
 
-    # ===================== ⚠️ ЖАЛОБА =====================
+    incoming = await get_incoming_likes_count(user_tg_id)
+    if incoming > 0:
+        await show_incoming_like_profile(message)
+    else:
+        await show_random_profile(message)
+
+
+# ===================== ⚠️ ЖАЛОБА =====================
+
+
 @router.message(F.text == "⚠️")
 async def handle_complaint_button(message: Message, state: FSMContext):
     if await check_blacklist(message):
@@ -2381,7 +2975,7 @@ async def handle_complaint_text_invalid(message: Message, state: FSMContext):
 async def handle_sleep(message: Message, state: FSMContext):
     await state.clear()
     current_targets.pop(message.from_user.id, None)
-    saved_browse_targets.pop(message.from_user.id, None)
+    user_browse_position.pop(message.from_user.id, None)  # Сбрасываем сохранённую позицию
     await show_main_menu(message)
 
 
@@ -2525,26 +3119,7 @@ async def admin_match_toggle(message: Message, state: FSMContext):
         )
 
 
-# ===================== АДМИН: 🛑 СТОП ВОПРОСОВ =====================
-
-
-@router.message(F.text == "🛑 Стоп вопросов")
-async def admin_stop_stories(message: Message, state: FSMContext):
-    """Раскрывает истории всех участников (REVEAL_STORIES = True)."""
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    global REVEAL_STORIES
-    REVEAL_STORIES = True
-    await set_setting("reveal_stories", "1")
-    await send_with_custom_kb(
-        message.chat.id,
-        "🛑 <b>Истории недели раскрыты!</b>\n"
-        "Теперь все видят полные ответы участников в их анкетах.",
-        admin_menu_kb(),
-    )
-
-
-# ===================== АДМИН: РАССЫЛКА (через copy_message) =====================
+# ===================== АДМИН: РАССЫЛКА (СТАРАЯ) =====================
 
 
 @router.message(F.text == "Рассылка")
@@ -2553,10 +3128,8 @@ async def admin_broadcast_start(message: Message, state: FSMContext):
         return
     await state.set_state(BroadcastForm.waiting_message)
     await message.answer(
-        "📣 <b>Отправь или перешли сообщение для рассылки.</b>\n\n"
-        "Бот разошлёт его всем пользователям через <code>copy_message</code>, "
-        "сохраняя текст, медиа, разметку и кнопки.\n\n"
-        "Можно: текст, фото, видео, GIF, пересланный пост из канала с текстом/фото/ссылкой/кнопками.\n\n"
+        "📣 <b>Отправь сообщение для рассылки.</b>\n\n"
+        "Можно отправить текст, фото с подписью или GIF с подписью.\n"
         "Для отмены отправь /cancel",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -2572,12 +3145,8 @@ async def admin_broadcast_cancel(message: Message, state: FSMContext):
     )
 
 
-@router.message(BroadcastForm.waiting_message)
+@router.message(BroadcastForm.waiting_message, F.content_type.in_({ContentType.TEXT, ContentType.PHOTO, ContentType.ANIMATION}))
 async def admin_broadcast_send(message: Message, state: FSMContext):
-    """
-    Рассылка через copy_message — сохраняет текст, медиа, разметку и inline-кнопки.
-    Поддерживает пересылку из каналов.
-    """
     if message.from_user.id not in ADMIN_IDS:
         return
     await state.clear()
@@ -2587,21 +3156,32 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
     success = 0
     fail = 0
 
-    src_chat_id = message.chat.id
-    src_msg_id = message.message_id
-
     for tg_id in all_ids:
         if tg_id == sender_tg_id:
             continue
         try:
-            await bot.copy_message(
-                chat_id=tg_id,
-                from_chat_id=src_chat_id,
-                message_id=src_msg_id,
-            )
+            if message.content_type == ContentType.PHOTO:
+                await bot.send_photo(
+                    tg_id,
+                    message.photo[-1].file_id,
+                    caption=message.caption or "",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif message.content_type == ContentType.ANIMATION:
+                await bot.send_animation(
+                    tg_id,
+                    message.animation.file_id,
+                    caption=message.caption or "",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await bot.send_message(
+                    tg_id,
+                    message.text,
+                    parse_mode=ParseMode.HTML,
+                )
             success += 1
-        except Exception as e:
-            logger.warning(f"Broadcast to {tg_id} failed: {e}")
+        except Exception:
             fail += 1
 
         await asyncio.sleep(0.05)
@@ -2615,6 +3195,92 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
     )
 
 
+@router.message(BroadcastForm.waiting_message)
+async def admin_broadcast_invalid(message: Message, state: FSMContext):
+    await message.answer(
+        "❌ Отправь <b>текст</b>, <b>фото</b> или <b>GIF</b>.\n"
+        "Для отмены: /cancel"
+    )
+
+
+# ===================== ЗАДАЧА 4: РАССЫЛКА COPY_MESSAGE =====================
+
+
+@router.message(F.text == "📨 Копи-рассылка")
+async def admin_copy_broadcast_start(message: Message, state: FSMContext):
+    """Запуск copy_message рассылки. Админ пересылает пост из канала."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(CopyBroadcastForm.waiting_forward)
+    await message.answer(
+        "📨 <b>Перешли сюда пост из канала</b> (или отправь любое сообщение).\n\n"
+        "Бот скопирует его всем юзерам через <code>copy_message</code> "
+        "(с сохранением медиа, разметки и кнопок).\n\n"
+        "Для отмены отправь /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("cancel"), CopyBroadcastForm.waiting_forward)
+async def admin_copy_broadcast_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await send_with_custom_kb(
+        message.chat.id,
+        "❌ Копи-рассылка отменена.",
+        admin_menu_kb(),
+    )
+
+
+@router.message(CopyBroadcastForm.waiting_forward)
+async def admin_copy_broadcast_send(message: Message, state: FSMContext):
+    """Копирует пересланное сообщение всем юзерам через copy_message."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+
+    from_chat_id = message.chat.id
+    message_id = message.message_id
+
+    # Если сообщение переслано из канала — используем оригинальный source
+    if message.forward_from_chat:
+        from_chat_id = message.forward_from_chat.id
+        message_id = message.forward_from_message_id
+
+    all_ids = await get_all_user_tg_ids()
+    success = 0
+    fail = 0
+
+    await send_with_custom_kb(
+        message.chat.id,
+        f"📨 Начинаю рассылку для <b>{len(all_ids)}</b> юзеров...",
+        {"remove_keyboard": True},
+    )
+
+    for tg_id in all_ids:
+        if tg_id == message.from_user.id:
+            continue
+        try:
+            await bot.copy_message(
+                chat_id=tg_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
+            success += 1
+        except Exception as e:
+            logger.debug(f"copy_message failed for {tg_id}: {e}")
+            fail += 1
+
+        await asyncio.sleep(0.05)
+
+    await send_with_custom_kb(
+        message.chat.id,
+        f"✅ <b>Копи-рассылка завершена!</b>\n\n"
+        f"Успешно: {success}\n"
+        f"Ошибок: {fail}",
+        admin_menu_kb(),
+    )
+
+
 # ===================== ВЫЙТИ ИЗ АДМИНКИ =====================
 
 
@@ -2622,585 +3288,6 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
 async def admin_exit(message: Message, state: FSMContext):
     await state.clear()
     await show_main_menu(message)
-
-
-# =====================================================================
-# ===================== ЗАДАЧА 1: ГЕО-НЕТВОРКИНГ ======================
-# =====================================================================
-
-
-def _today_date():
-    return datetime.now().date()
-
-
-async def _networking_recipients() -> list[int]:
-    """Список получателей рассылки гео-нетворкинга."""
-    if ALLOW_NETWORKING_ALL:
-        return await get_all_user_tg_ids()
-    return list(TESTER_IDS)
-
-
-async def networking_morning_broadcast():
-    """12:10 — рассылка вопроса 'В каком ты сегодня корпусе?'."""
-    logger.info("[NETWORKING] Morning broadcast started")
-    recipients = await _networking_recipients()
-    sent = 0
-    for tg_id in recipients:
-        try:
-            if await is_blacklisted(tg_id):
-                continue
-            await bot.send_message(
-                tg_id,
-                "📍 <b>В каком ты сегодня корпусе?</b>\n\n"
-                "Выбери здание — найдём, кто рядом, и предложим встретиться у главного выхода 🤝",
-                parse_mode=ParseMode.HTML,
-                reply_markup=networking_buildings_kb(),
-            )
-            sent += 1
-        except Exception as e:
-            logger.warning(f"[NETWORKING] morning send to {tg_id} failed: {e}")
-        await asyncio.sleep(0.05)
-    logger.info(f"[NETWORKING] Morning broadcast done: {sent}")
-
-
-@router.callback_query(F.data.startswith("net_b_"))
-async def handle_networking_building(callback: CallbackQuery, state: FSMContext):
-    """Юзер выбрал корпус — записываем и edit_message на вопрос про встречу."""
-    await callback.answer()
-
-    code = callback.data.replace("net_b_", "")
-    label = next((lbl for c, lbl in CAMPUS_BUILDINGS if c == code), code)
-
-    tg_id = callback.from_user.id
-    today = _today_date()
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO networking_answers (tg_id, day, building, meet)
-            VALUES ($1, $2, $3, 0)
-            ON CONFLICT (tg_id, day) DO UPDATE SET building=EXCLUDED.building, meet=0
-            """,
-            tg_id, today, code,
-        )
-
-    if code == "nope":
-        try:
-            await callback.message.edit_text(
-                f"📍 Окей, сегодня не в универе. Хорошего дня! 😊",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        return
-
-    try:
-        await callback.message.edit_text(
-            f"📍 <b>Корпус:</b> {html_module.escape(label)}\n\n"
-            f"🤝 <b>Встречаемся у главного выхода?</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=networking_meet_kb(),
-        )
-    except Exception as e:
-        logger.warning(f"[NETWORKING] edit_message failed for {tg_id}: {e}")
-        try:
-            await bot.send_message(
-                tg_id,
-                f"📍 <b>Корпус:</b> {html_module.escape(label)}\n\n"
-                f"🤝 <b>Встречаемся у главного выхода?</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=networking_meet_kb(),
-            )
-        except Exception:
-            pass
-
-
-@router.callback_query(F.data.startswith("net_m_"))
-async def handle_networking_meet(callback: CallbackQuery, state: FSMContext):
-    """Юзер ответил Да/Нет на 'Встречаемся у главного выхода?'."""
-    await callback.answer()
-
-    answer = callback.data.replace("net_m_", "")  # yes / no
-    meet = 1 if answer == "yes" else 0
-    tg_id = callback.from_user.id
-    today = _today_date()
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE networking_answers SET meet=$1
-            WHERE tg_id=$2 AND day=$3
-            """,
-            meet, tg_id, today,
-        )
-
-    if meet:
-        new_text = (
-            "✅ <b>Отлично!</b>\n\n"
-            "В <b>13:20</b> пришлём список тех, кто тоже сегодня в твоём корпусе и готов встретиться 🤝"
-        )
-    else:
-        new_text = "👌 Хорошо, без встреч сегодня. Удачного дня!"
-
-    try:
-        await callback.message.edit_text(new_text, parse_mode=ParseMode.HTML)
-    except Exception:
-        try:
-            await bot.send_message(tg_id, new_text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-
-async def networking_results_broadcast():
-    """13:20 — рассылка итогов: список @username тех, кто в том же корпусе и нажал Да."""
-    logger.info("[NETWORKING] Results broadcast started")
-    today = _today_date()
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT na.tg_id, na.building, u.tg_username, u.username
-            FROM networking_answers na
-            LEFT JOIN users u ON u.tg_id = na.tg_id
-            WHERE na.day=$1 AND na.meet=1 AND na.building IS NOT NULL AND na.building <> 'nope'
-            """,
-            today,
-        )
-
-    by_building: dict[str, list[dict]] = {}
-    for r in rows:
-        r = dict(r)
-        by_building.setdefault(r["building"], []).append(r)
-
-    label_map = {c: lbl for c, lbl in CAMPUS_BUILDINGS}
-    sent = 0
-
-    for building, people in by_building.items():
-        if not people:
-            continue
-
-        building_label = label_map.get(building, building)
-
-        for person in people:
-            others = [p for p in people if p["tg_id"] != person["tg_id"]]
-
-            if not others:
-                text = (
-                    f"📍 <b>Корпус: {html_module.escape(building_label)}</b>\n\n"
-                    f"😔 Сегодня больше никто не отметился у главного выхода.\n"
-                    f"Попробуй завтра!"
-                )
-            else:
-                lines = []
-                for p in others:
-                    if p.get("tg_username"):
-                        lines.append(f"• @{p['tg_username']}")
-                    else:
-                        name = html_module.escape(str(p.get("username", "Профиль")))
-                        lines.append(f"• <a href='tg://user?id={p['tg_id']}'>{name}</a>")
-
-                text = (
-                    f"🤝 <b>Встреча у главного выхода — {html_module.escape(building_label)}</b>\n\n"
-                    f"Сегодня там же будут:\n" + "\n".join(lines) +
-                    "\n\nХорошей встречи! 🎉"
-                )
-
-            try:
-                await bot.send_message(
-                    person["tg_id"], text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                sent += 1
-            except Exception as e:
-                logger.warning(f"[NETWORKING] result send to {person['tg_id']} failed: {e}")
-
-            await asyncio.sleep(0.05)
-
-    logger.info(f"[NETWORKING] Results broadcast finished. Total sent: {sent}")
-
-
-# =====================================================================
-# ===================== ЗАДАЧА 2: ИГРА «БОЧКА» ========================
-# =====================================================================
-
-
-async def _story_recipients() -> list[int]:
-    """Получатели рассылки story-вопросов (с учётом флага)."""
-    if ALLOW_STORY_ALL:
-        return await get_all_user_tg_ids()
-    return list(TESTER_IDS)
-
-
-async def get_story_question(day_of_week: int) -> Optional[dict]:
-    """Возвращает один вопрос для указанного дня недели (0=Пн ... 6=Вс)."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, question, day_of_week
-            FROM story_questions
-            WHERE day_of_week=$1
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            day_of_week,
-        )
-    return dict(row) if row else None
-
-
-async def get_story_participant(tg_id: int) -> Optional[dict]:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM story_participants WHERE tg_id=$1", tg_id
-        )
-    return dict(row) if row else None
-
-
-async def set_story_participant_status(tg_id: int, status: str):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO story_participants (tg_id, status, joined_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (tg_id) DO UPDATE SET status=EXCLUDED.status
-            """,
-            tg_id, status,
-        )
-
-
-async def has_story_answer_for_day(tg_id: int, day_of_week: int) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM story_answers WHERE tg_id=$1 AND day_of_week=$2",
-            tg_id, day_of_week,
-        )
-    return row is not None
-
-
-async def save_story_answer(tg_id: int, day_of_week: int, question_id: Optional[int], answer: str):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO story_answers (tg_id, day_of_week, question_id, answer)
-            VALUES ($1, $2, $3, $4)
-            """,
-            tg_id, day_of_week, question_id, answer,
-        )
-
-
-async def story_monday_broadcast():
-    """Понедельник 10:00 — первый вопрос недели с кнопками [Ответить]/[Не участвовать]."""
-    logger.info("[STORY] Monday broadcast started")
-
-    question = await get_story_question(0)
-    if not question:
-        logger.warning("[STORY] No question for Monday")
-        return
-
-    recipients = await _story_recipients()
-    sent = 0
-    for tg_id in recipients:
-        try:
-            if await is_blacklisted(tg_id):
-                continue
-            await bot.send_message(
-                tg_id,
-                f"🎭 <b>Игра «Бочка» — История недели</b>\n\n"
-                f"Каждый день недели — один короткий вопрос. К концу недели у тебя получится "
-                f"маленькая история, которую увидят все в твоей анкете.\n\n"
-                f"<b>Вопрос на сегодня:</b>\n"
-                f"{html_module.escape(question['question'])}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=story_first_day_kb(),
-            )
-            sent += 1
-        except Exception as e:
-            logger.warning(f"[STORY] monday send to {tg_id} failed: {e}")
-        await asyncio.sleep(0.05)
-    logger.info(f"[STORY] Monday broadcast done: {sent}")
-
-
-async def story_monday_deadline():
-    """Пн 23:00 — все, кто не нажал кнопок и не ответил, помечаются как inactive."""
-    logger.info("[STORY] Monday deadline check")
-    recipients = await _story_recipients()
-
-    for tg_id in recipients:
-        participant = await get_story_participant(tg_id)
-        if participant is None:
-            # Не нажал ничего — вылетает
-            await set_story_participant_status(tg_id, "inactive")
-        elif participant["status"] == "active":
-            # Проверяем, ответил ли на понедельничный вопрос
-            has_answer = await has_story_answer_for_day(tg_id, 0)
-            if not has_answer:
-                # Нажал [Ответить], но не прислал ответ — вылетает
-                await set_story_participant_status(tg_id, "inactive")
-
-
-async def story_daily_broadcast(day_of_week: int):
-    """
-    Вт-Чт: рассылка вопроса дня активным участникам.
-    Перед вопросом — текущий прогресс (HTML blockquote с троеточием и кавычками «»).
-    Если человек пропустил вчера — сначала вчерашний вопрос, потом сегодняшний.
-    """
-    logger.info(f"[STORY] Daily broadcast for day {day_of_week}")
-    today_q = await get_story_question(day_of_week)
-    if not today_q:
-        logger.warning(f"[STORY] No question for day {day_of_week}")
-        return
-
-    recipients = await _story_recipients()
-
-    for tg_id in recipients:
-        try:
-            if await is_blacklisted(tg_id):
-                continue
-
-            participant = await get_story_participant(tg_id)
-            if not participant or participant["status"] != "active":
-                continue
-
-            # Проверяем пропущенный вчерашний вопрос
-            yesterday_dow = day_of_week - 1
-            missed = False
-            if yesterday_dow >= 0:
-                has_yesterday = await has_story_answer_for_day(tg_id, yesterday_dow)
-                if not has_yesterday:
-                    missed = True
-
-            # Прогресс
-            answers = await get_user_story_answers(tg_id)
-            if answers:
-                progress_text = " ".join(html_module.escape(a["answer"]) for a in answers)
-                progress_msg = (
-                    "📖 <b>Твоя история за прошлые дни:</b>\n"
-                    f"<blockquote>«{progress_text}»</blockquote>..."
-                )
-                await bot.send_message(tg_id, progress_msg, parse_mode=ParseMode.HTML)
-                await asyncio.sleep(0.1)
-
-            if missed:
-                yest_q = await get_story_question(yesterday_dow)
-                if yest_q:
-                    await bot.send_message(
-                        tg_id,
-                        f"😅 <b>Вы вчера забыли ответить на вопрос. Ответьте на два вопроса сегодня.</b>\n\n"
-                        f"<b>Вчерашний вопрос:</b>\n{html_module.escape(yest_q['question'])}",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=story_answer_kb(missed=True),
-                    )
-                    # Сегодняшний вопрос придёт ПОСЛЕ ответа на вчерашний (см. callback)
-                    continue
-
-            # Сегодняшний вопрос (обычная ситуация)
-            await bot.send_message(
-                tg_id,
-                f"🎭 <b>Вопрос дня:</b>\n{html_module.escape(today_q['question'])}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=story_answer_kb(missed=False),
-            )
-        except Exception as e:
-            logger.warning(f"[STORY] daily send to {tg_id} failed: {e}")
-        await asyncio.sleep(0.05)
-
-
-async def story_sunday_cleanup():
-    """Вс 23:59 — полная очистка story_answers/story_participants и сброс REVEAL_STORIES."""
-    global REVEAL_STORIES
-    logger.info("[STORY] Sunday cleanup started")
-    async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE TABLE story_answers RESTART IDENTITY")
-        await conn.execute("TRUNCATE TABLE story_participants RESTART IDENTITY")
-    REVEAL_STORIES = False
-    await set_setting("reveal_stories", "0")
-    logger.info("[STORY] Sunday cleanup done. REVEAL_STORIES reset to False.")
-
-
-# === STORY === Inline callback: Не участвовать
-@router.callback_query(F.data == "story_skip")
-async def cb_story_skip(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    tg_id = callback.from_user.id
-    await set_story_participant_status(tg_id, "inactive")
-    try:
-        await callback.message.edit_text(
-            "🚫 <b>Ок, в этой неделе не участвуешь.</b>\n"
-            "Со следующего понедельника снова получишь приглашение!",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-
-
-# === STORY === Inline callback: ✏️ Ответить (на сегодняшний вопрос — понедельник)
-@router.callback_query(F.data == "story_join")
-async def cb_story_join(callback: CallbackQuery, state: FSMContext):
-    """Понедельник: пользователь нажал ✏️ Ответить — переводим в FSM."""
-    await callback.answer()
-    tg_id = callback.from_user.id
-
-    await set_story_participant_status(tg_id, "active")
-
-    # Сегодняшний вопрос (по дню недели)
-    today_dow = datetime.now().weekday()
-    question = await get_story_question(today_dow)
-    if not question:
-        try:
-            await callback.message.edit_text("❌ Вопрос не найден.", parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        return
-
-    await state.set_state(StoryStates.waiting_answer)
-    await state.update_data(story_question_id=question["id"], story_day=today_dow)
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    await bot.send_message(
-        tg_id,
-        f"✏️ <b>Ответь кратко на вопрос:</b>\n\n"
-        f"{html_module.escape(question['question'])}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@router.callback_query(F.data == "story_answer")
-async def cb_story_answer(callback: CallbackQuery, state: FSMContext):
-    """Вт-Чт: нажатие [✏️ Ответить] под обычным вопросом дня."""
-    await callback.answer()
-    tg_id = callback.from_user.id
-
-    today_dow = datetime.now().weekday()
-    question = await get_story_question(today_dow)
-    if not question:
-        return
-
-    await state.set_state(StoryStates.waiting_answer)
-    await state.update_data(story_question_id=question["id"], story_day=today_dow)
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    await bot.send_message(
-        tg_id,
-        f"✏️ <b>Ответь кратко на вопрос:</b>\n\n"
-        f"{html_module.escape(question['question'])}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@router.callback_query(F.data == "story_answer_missed")
-async def cb_story_answer_missed(callback: CallbackQuery, state: FSMContext):
-    """Кнопка под пропущенным вчерашним вопросом."""
-    await callback.answer()
-    tg_id = callback.from_user.id
-
-    today_dow = datetime.now().weekday()
-    yesterday_dow = today_dow - 1
-    if yesterday_dow < 0:
-        return
-
-    yest_q = await get_story_question(yesterday_dow)
-    if not yest_q:
-        return
-
-    await state.set_state(StoryStates.waiting_answer_missed)
-    await state.update_data(
-        story_question_id=yest_q["id"],
-        story_day=yesterday_dow,
-    )
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    await bot.send_message(
-        tg_id,
-        f"✏️ <b>Ответь на вчерашний вопрос:</b>\n\n"
-        f"{html_module.escape(yest_q['question'])}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@router.message(StoryStates.waiting_answer_missed, F.text)
-async def process_story_answer_missed(message: Message, state: FSMContext):
-    """Ответ на ВЧЕРАШНИЙ пропущенный вопрос. После — присылаем сегодняшний."""
-    answer = message.text.strip()
-    if not answer:
-        await message.answer("❌ Ответ не может быть пустым.")
-        return
-
-    data = await state.get_data()
-    qid = data.get("story_question_id")
-    day = data.get("story_day")
-    await state.clear()
-
-    tg_id = message.from_user.id
-    await save_story_answer(tg_id, day, qid, answer)
-    await message.answer("✅ <b>Ответ на вчерашний вопрос сохранён!</b>", parse_mode=ParseMode.HTML)
-
-    # Теперь даём сегодняшний вопрос
-    today_dow = datetime.now().weekday()
-    today_q = await get_story_question(today_dow)
-
-    # Проверяем: есть ли вопрос на сегодня и не отвечал ли на него юзер уже
-    if today_q and not await has_story_answer_for_day(tg_id, today_dow):
-        await bot.send_message(
-            tg_id,
-            f"🎭 <b>А теперь вопрос на сегодня:</b>\n\n"
-            f"{html_module.escape(today_q['question_text'])}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=story_answer_kb(missed=False),
-        )
-    else:
-        await show_main_menu(message)
-
-@router.message(StoryStates.waiting_answer, F.text)
-async def process_story_answer(message: Message, state: FSMContext):
-    """Ответ на СЕГОДНЯШНИЙ вопрос."""
-    answer = message.text.strip()
-    if not answer:
-        await message.answer("❌ Ответ не может быть пустым.")
-        return
-
-    data = await state.get_data()
-    qid = data.get("story_question_id")
-    day = data.get("story_day")
-    await state.clear()
-
-    tg_id = message.from_user.id
-    await save_story_answer(tg_id, day, qid, answer)
-
-    # Подтверждаем участие в игре
-    await message.answer(
-        "🎉 <b>Готово! Ты в игре.</b>\n\n"
-        "Каждый день будет приходить новый вопрос — твоя история растёт. "
-        "В конце недели вся история откроется в твоей анкете.",
-        parse_mode=ParseMode.HTML,
-    )
-
-    # Главное меню
-    await show_main_menu(message)
-
-
-@router.message(StoryStates.waiting_answer)
-async def process_story_answer_invalid(message: Message, state: FSMContext):
-    await message.answer("❌ Отправь <b>текстовый</b> ответ.")
-
-
-@router.message(StoryStates.waiting_answer_missed)
-async def process_story_answer_missed_invalid(message: Message, state: FSMContext):
-    await message.answer("❌ Отправь <b>текстовый</b> ответ на вчерашний вопрос.")
 
 
 # ===================== FALLBACK =====================
@@ -3220,92 +3307,38 @@ async def fallback(message: Message, state: FSMContext):
     )
 
 
-# ===================== SCHEDULER =====================
-
-
-def setup_scheduler():
-    """Настраиваем все cron-задачи."""
-    global scheduler
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-
-    # === ЗАДАЧА 1: ГЕО-НЕТВОРКИНГ ===
-    # Каждый день в 12:10 — вопрос о корпусе
-    scheduler.add_job(
-        networking_morning_broadcast,
-        CronTrigger(hour=12, minute=10),
-        id="networking_morning",
-        replace_existing=True,
-    )
-    # Каждый день в 13:20 — итоги встреч
-    scheduler.add_job(
-        networking_results_broadcast,
-        CronTrigger(hour=13, minute=20),
-        id="networking_results",
-        replace_existing=True,
-    )
-
-    # === ЗАДАЧА 2: ИГРА «БОЧКА» ===
-    # Понедельник 10:00 — первый вопрос недели + кнопки [Ответить]/[Не участвовать]
-    scheduler.add_job(
-        story_monday_broadcast,
-        CronTrigger(day_of_week="mon", hour=10, minute=0),
-        id="story_monday",
-        replace_existing=True,
-    )
-    # Понедельник 23:00 — кто не отметился, помечается как inactive до конца недели
-    scheduler.add_job(
-        story_monday_deadline,
-        CronTrigger(day_of_week="mon", hour=23, minute=0),
-        id="story_monday_deadline",
-        replace_existing=True,
-    )
-    # Вт-Чт в 10:00 — вопрос дня
-    for dow_name, dow_num in [("tue", 1), ("wed", 2), ("thu", 3)]:
-        scheduler.add_job(
-            story_daily_broadcast,
-            CronTrigger(day_of_week=dow_name, hour=10, minute=0),
-            id=f"story_daily_{dow_name}",
-            kwargs={"day_of_week": dow_num},
-            replace_existing=True,
-        )
-    # Воскресенье 23:59 — полная очистка таблиц и сброс REVEAL_STORIES
-    scheduler.add_job(
-        story_sunday_cleanup,
-        CronTrigger(day_of_week="sun", hour=23, minute=59),
-        id="story_sunday_cleanup",
-        replace_existing=True,
-    )
-
-    scheduler.start()
-    logger.info("AsyncIOScheduler started with networking & story jobs")
-
-
 # ===================== MAIN =====================
 
 
 async def on_startup():
-    global REVEAL_STORIES
     await create_pool()
     await init_db()
     await migrate_from_sqlite()
 
-    # Восстанавливаем REVEAL_STORIES из БД (на случай рестарта после "Стоп вопросов")
-    val = await get_setting("reveal_stories")
-    if val == "1":
-        REVEAL_STORIES = True
+    # === SCHEDULER: Гео-нетворкинг ===
+    # 12:10 Пн-Сб (day_of_week: mon-sat)
+    scheduler.add_job(
+        geo_send_question,
+        CronTrigger(hour=12, minute=10, day_of_week="mon-sat", timezone="Europe/Moscow"),
+        id="geo_question",
+        replace_existing=True,
+    )
+    # 13:20 Пн-Сб — результаты
+    scheduler.add_job(
+        geo_send_results,
+        CronTrigger(hour=13, minute=20, day_of_week="mon-sat", timezone="Europe/Moscow"),
+        id="geo_results",
+        replace_existing=True,
+    )
 
-    setup_scheduler()
+    scheduler.start()
+    logger.info("Scheduler started with geo-networking jobs (Mon-Sat)")
     logger.info("Bot started")
 
 
 async def on_shutdown():
-    global pool, scheduler
-    if scheduler:
-        try:
-            scheduler.shutdown(wait=False)
-            logger.info("Scheduler stopped")
-        except Exception:
-            pass
+    global pool
+    scheduler.shutdown(wait=False)
     if pool:
         await pool.close()
         logger.info("PostgreSQL pool closed")
