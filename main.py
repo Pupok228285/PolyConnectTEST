@@ -3147,19 +3147,18 @@ async def process_story_answer_missed(message: Message, state: FSMContext):
 
     tg_id = message.from_user.id
     await save_story_answer(tg_id, day, qid, answer)
-
     await message.answer("✅ <b>Ответ на вчерашний вопрос сохранён!</b>", parse_mode=ParseMode.HTML)
 
     # Теперь даём сегодняшний вопрос
     today_dow = datetime.now().weekday()
     today_q = await get_story_question(today_dow)
-    if today_dow = datetime.now().weekday()
-    today_q = await get_story_question(today_dow)
+
+    # Проверяем: есть ли вопрос на сегодня и не отвечал ли на него юзер уже
     if today_q and not await has_story_answer_for_day(tg_id, today_dow):
         await bot.send_message(
             tg_id,
             f"🎭 <b>А теперь вопрос на сегодня:</b>\n\n"
-            f"{html_module.escape(today_q['question'])}",
+            f"{html_module.escape(today_q['question_text'])}",
             parse_mode=ParseMode.HTML,
             reply_markup=story_answer_kb(missed=False),
         )
