@@ -334,6 +334,8 @@ async def init_db():
                 "hide_matched", "1",
             )
     logger.info("Database tables initialized")
+    await conn.execute(
+        "ALTER TABLE story_participants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
 
 
 # ===================== МИГРАЦИЯ ИЗ SQLITE =====================
@@ -358,9 +360,19 @@ async def migrate_from_sqlite():
     # --- users ---
     rows = await sqlite_db.execute_fetchall("SELECT * FROM users")
     async with pool.acquire() as conn:
-        for r in rows:
-            r = dict(r)
-            await conn.execute(
+        # Готовим список кортежей с данными
+        data_to_insert = [
+            (
+                r.get("tg_id"), r.get("tg_username"), r.get("username"),
+                r.get("photo_file_id"), r.get("gender"), r.get("age"),
+                r.get("faculty"), r.get("about"), r.get("is_active"),
+                r.get("looking_for")
+            )
+            for r in rows
+        ]
+
+        if data_to_insert:
+            await conn.executemany(
                 """
                 INSERT INTO users (tg_id, tg_username, username, photo_file_id,
                                    gender, age, faculty, about, is_active,
@@ -368,11 +380,9 @@ async def migrate_from_sqlite():
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
                 ON CONFLICT (tg_id) DO NOTHING
                 """,
-                r.get("tg_id"), r.get("tg_username"), r.get("username"),
-                r.get("photo_file_id"), r.get("gender"), r.get("age"),
-                r.get("faculty"), r.get("about"), r.get("is_active"),
-                r.get("looking_for")
+                data_to_insert
             )
+
     logger.info(f"Migrated {len(rows)} users with current timestamp")
 
     # Маппинг старых SQLite id -> новые PG id
