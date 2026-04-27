@@ -3315,13 +3315,10 @@ async def reset_weekly_story():
     global pool
     async with pool.acquire() as conn:
         try:
-            # 1. Удаляем все ответы за прошлую неделю
             await conn.execute("DELETE FROM story_answers")
-            # 2. Удаляем записи об участии (чтобы все могли зайти заново)
             await conn.execute("DELETE FROM story_participants")
-            # 3. Сбрасываем флаг открытия историй в системных настройках
-            await conn.execute("UPDATE sys_settings SET val_bool = FALSE WHERE key = 'reveal_stories'")
-
+            # Исправлено название таблицы на settings (как в init_db)
+            await conn.execute("UPDATE settings SET value = '0' WHERE key = 'reveal_stories'")
             logger.info("История недели успешно очищена автоматически (Sunday Reset)")
         except Exception as e:
             logger.error(f"Ошибка при автоматической очистке истории: {e}")
