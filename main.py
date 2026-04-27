@@ -3316,14 +3316,14 @@ async def on_startup():
     await migrate_from_sqlite()
 
     # === SCHEDULER: Гео-нетворкинг ===
-    # 12:10 Пн-Сб (day_of_week: mon-sat)
+    # 12:10 Пн-Сб — Вопрос про корпус
     scheduler.add_job(
         geo_send_question,
-        CronTrigger(hour=8, minute=40, day_of_week="mon-sat", timezone="Europe/Moscow"),
+        CronTrigger(hour=12, minute=10, day_of_week="mon-sat", timezone="Europe/Moscow"),
         id="geo_question",
         replace_existing=True,
     )
-    # 13:20 Пн-Сб — результаты
+    # 13:20 Пн-Сб — Результаты нетворкинга
     scheduler.add_job(
         geo_send_results,
         CronTrigger(hour=13, minute=20, day_of_week="mon-sat", timezone="Europe/Moscow"),
@@ -3331,8 +3331,17 @@ async def on_startup():
         replace_existing=True,
     )
 
+    # === SCHEDULER: Игра «Бочка» ===
+    # Очистка истории каждую неделю в Вс 23:59
+    scheduler.add_job(
+        reset_weekly_story, # Убедись, что функция с таким именем у тебя есть
+        CronTrigger(day_of_week="sun", hour=23, minute=59, timezone="Europe/Moscow"),
+        id="story_reset",
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("Scheduler started with geo-networking jobs (Mon-Sat)")
+    logger.info("Scheduler started: Geo (12:10/13:20) + Story Reset (Sun 23:59)")
     logger.info("Bot started")
 
 
