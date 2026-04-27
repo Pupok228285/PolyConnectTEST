@@ -1,3 +1,7 @@
+# ===================== main.py — ПОЛНОЕ ОБНОВЛЕНИЕ =====================
+# aiogram 3.x + PostgreSQL (asyncpg) + APScheduler (AsyncIOScheduler)
+# =====================================================================
+
 from aiogram.client.default import DefaultBotProperties
 import asyncio
 import logging
@@ -5,7 +9,7 @@ import random
 import html as html_module
 import json
 from typing import Optional
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, date
 
 import os
 import telebot
@@ -35,7 +39,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 # ===================== НАСТРОЙКИ =====================
 
-#load_dotenv()
+# load_dotenv()
 
 API_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 COMPLAINT_BOT_TOKEN = os.getenv("HELPER_BOT_TOKEN")
@@ -73,7 +77,7 @@ CAMPUS_BUILDINGS = [
     ("bibl", "Библиотека"),
     ("teh",  "Технический корпус"),
     ("gum",  "Гуманитарный корпус"),
-    ("sport","Спортивный корпус"),
+    ("sport", "Спортивный корпус"),
     ("nope", "Сегодня не в универе"),
 ]
 
@@ -174,6 +178,9 @@ class StoryStates(StatesGroup):
 
 current_targets: dict[int, int] = {}
 user_queues: dict[int, list[int]] = {}
+
+# === RETURN === Сохранённые target_id при переходе во «Входящие лайки»
+saved_browse_targets: dict[int, int] = {}
 
 # ===================== ГЛОБАЛЬНЫЙ ПУЛ ASYNCPG =====================
 
@@ -313,7 +320,7 @@ async def init_db():
             for dow, q in default_questions:
                 await conn.execute(
                     "INSERT INTO story_questions (day_of_week, question) VALUES ($1, $2)",
-                    dow, q
+                    dow, q,
                 )
 
         row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", "hide_matched")
@@ -360,7 +367,7 @@ async def migrate_from_sqlite():
                 r.get("tg_id"), r.get("tg_username"), r.get("username"),
                 r.get("photo_file_id"), r.get("gender"), r.get("age"),
                 r.get("faculty"), r.get("about"), r.get("is_active"),
-                r.get("looking_for")
+                r.get("looking_for"),
             )
     logger.info(f"Migrated {len(rows)} users with current timestamp")
 
@@ -399,7 +406,7 @@ async def migrate_from_sqlite():
                 new_viewer,
                 new_target,
                 r.get("is_like", 0),
-                r.get("viewed_in_incoming", 0)
+                r.get("viewed_in_incoming", 0),
             )
             migrated_swipes += 1
         logger.info(f"Migrated {migrated_swipes} swipes")
@@ -1122,8 +1129,8 @@ async def get_user_story_answers(tg_id: int) -> list[dict]:
 
 def _format_story_block(answers: list[dict], reveal: bool, owner_view: bool) -> str:
     """
-    Формирует блок 'История недели' для анкеты.
-    - reveal=True: всем видны ответы без троеточия.
+    Формирует блок '✨ История недели' для анкеты.
+    - reveal=True: всем видны ответы без троеточия, в кавычках «».
     - reveal=False, owner_view=True: владелец видит свои ответы с троеточием.
     - reveal=False, owner_view=False: остальные видят 🔐 *****.
     """
@@ -1132,15 +1139,15 @@ def _format_story_block(answers: list[dict], reveal: bool, owner_view: bool) -> 
         if not answers:
             return ""
         text = " ".join(html_module.escape(a["answer"]) for a in answers)
-        return header + f"<blockquote>[{text}]</blockquote>"
+        return header + f"<blockquote>«{text}»</blockquote>"
     else:
         if owner_view:
             if not answers:
                 return ""
             text = " ".join(html_module.escape(a["answer"]) for a in answers)
-            return header + f"<blockquote>[{text}]</blockquote>..."
+            return header + f"<blockquote>«{text}»</blockquote>..."
         else:
-            return header + f"<blockquote>🔐 <code>*****</code></blockquote>"
+            return header + f'<blockquote>«🔐 <code>*****</code>»</blockquote>'
 
 
 def format_profile_text(user: dict, show_status: bool = False, story_block: str = "") -> str:
@@ -1188,6 +1195,11 @@ async def build_story_block_for(target_user: dict, viewer_tg_id: Optional[int]) 
     if not target_tg_id:
         return ""
     answers = await get_user_story_answers(target_tg_id)
+    # Если у пользователя нет ответов и reveal=False — проверяем, является ли он участником
+    if not answers and not REVEAL_STORIES:
+        participant = await get_story_participant(target_tg_id)
+        if not participant or participant["status"] != "active":
+            return ""
     owner_view = (viewer_tg_id is not None and viewer_tg_id == target_tg_id)
     return _format_story_block(answers, reveal=REVEAL_STORIES, owner_view=owner_view)
 
@@ -1548,6 +1560,8 @@ async def my_profile_browse(message: Message, state: FSMContext):
 
     incoming_count = await get_incoming_likes_count(message.from_user.id)
     if incoming_count > 0:
+        # === RETURN === Сохраняем текущий target перед входом в «Входящие»
+        _save_browse_target(message.from_user.id)
         word = "человеку" if incoming_count == 1 else "людям"
         await send_with_custom_kb(
             message.chat.id,
@@ -1733,6 +1747,8 @@ async def browse_profiles(message: Message, state: FSMContext):
 
     incoming_count = await get_incoming_likes_count(message.from_user.id)
     if incoming_count > 0:
+        # === RETURN === Сохраняем текущий target перед входом в «Входящие»
+        _save_browse_target(message.from_user.id)
         word = "человеку" if incoming_count == 1 else "людям"
         await send_with_custom_kb(
             message.chat.id,
@@ -1741,7 +1757,7 @@ async def browse_profiles(message: Message, state: FSMContext):
         )
         return
 
-    # === RETURN === Если есть сохранённый target_id (после возврата из лайков/сообщений) — показать его
+    # === RETURN === Если есть сохранённый target_id (после возврата из лайков) — показать его
     saved_target = current_targets.get(message.from_user.id)
     if saved_target:
         target_user = await get_user_by_tg_id(saved_target)
@@ -1751,6 +1767,21 @@ async def browse_profiles(message: Message, state: FSMContext):
             return
 
     await show_random_profile(message)
+
+
+# === RETURN === Хелпер: сохранить текущий target при переходе в «Входящие лайки»
+def _save_browse_target(tg_id: int):
+    """Сохраняет current_targets[tg_id] в saved_browse_targets перед переходом в «Входящие»."""
+    target = current_targets.get(tg_id)
+    if target:
+        saved_browse_targets[tg_id] = target
+
+
+def _restore_browse_target(tg_id: int):
+    """Восстанавливает current_targets[tg_id] из saved_browse_targets после «Входящих»."""
+    saved = saved_browse_targets.pop(tg_id, None)
+    if saved:
+        current_targets[tg_id] = saved
 
 
 async def show_random_profile(message: Message):
@@ -1787,6 +1818,17 @@ async def show_incoming_like_profile(message: Message):
                 incoming_like_kb(),
             )
     else:
+        # === RETURN === Все входящие лайки просмотрены — восстанавливаем target из ленты
+        _restore_browse_target(message.from_user.id)
+
+        saved_target = current_targets.get(message.from_user.id)
+        if saved_target:
+            target_user = await get_user_by_tg_id(saved_target)
+            if target_user and target_user.get("photo_file_id"):
+                show_msg_btn = can_send_like_message(message.from_user.id)
+                await send_profile_card(message.chat.id, target_user, browse_kb(show_message_button=show_msg_btn), viewer_tg_id=message.from_user.id)
+                return
+
         await show_random_profile(message)
 
 
@@ -1916,6 +1958,7 @@ async def process_like_message(message: Message, state: FSMContext):
         except Exception as e:
             logger.error(f"Failed to notify target {target_tg_id} about mutual match with message: {e}")
 
+        current_targets.pop(user_tg_id, None)
         await show_main_menu(message)
         return
 
@@ -1966,6 +2009,7 @@ async def process_like_message(message: Message, state: FSMContext):
 
     incoming = await get_incoming_likes_count(user_tg_id)
     if incoming > 0:
+        _save_browse_target(user_tg_id)
         await show_incoming_like_profile(message)
     else:
         await show_random_profile(message)
@@ -2170,6 +2214,8 @@ async def handle_like(message: Message, state: FSMContext):
 
         # Сбрасываем сохранённый target — мэтч закрыт
         current_targets.pop(user_tg_id, None)
+        saved_browse_targets.pop(user_tg_id, None)
+        await show_main_menu(message)
         return
 
     else:
@@ -2215,17 +2261,13 @@ async def handle_dislike(message: Message, state: FSMContext):
         await add_dislike(user_tg_id, target_tg_id)
         # Дизлайк — сбрасываем target, чтобы при возврате не показать его снова
         current_targets.pop(user_tg_id, None)
+        incoming = await get_incoming_likes_count(user_tg_id)
+        if incoming > 0:
+            await show_incoming_like_profile(message)
+        else:
+            await show_random_profile(message)
 
-    incoming = await get_incoming_likes_count(user_tg_id)
-    if incoming > 0:
-        await show_incoming_like_profile(message)
-    else:
-        await show_random_profile(message)
-
-
-# ===================== ⚠️ ЖАЛОБА =====================
-
-
+    # ===================== ⚠️ ЖАЛОБА =====================
 @router.message(F.text == "⚠️")
 async def handle_complaint_button(message: Message, state: FSMContext):
     if await check_blacklist(message):
@@ -2339,6 +2381,7 @@ async def handle_complaint_text_invalid(message: Message, state: FSMContext):
 async def handle_sleep(message: Message, state: FSMContext):
     await state.clear()
     current_targets.pop(message.from_user.id, None)
+    saved_browse_targets.pop(message.from_user.id, None)
     await show_main_menu(message)
 
 
@@ -2551,8 +2594,6 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
         if tg_id == sender_tg_id:
             continue
         try:
-            # copy_message сохраняет всё содержимое исходного сообщения,
-            # включая разметку (HTML/Markdown), inline-кнопки, медиа и подписи.
             await bot.copy_message(
                 chat_id=tg_id,
                 from_chat_id=src_chat_id,
@@ -2638,7 +2679,7 @@ async def handle_networking_building(callback: CallbackQuery, state: FSMContext)
             """
             INSERT INTO networking_answers (tg_id, day, building, meet)
             VALUES ($1, $2, $3, 0)
-            ON CONFLICT (tg_id, day) DO UPDATE SET building=EXCLUDED.building
+            ON CONFLICT (tg_id, day) DO UPDATE SET building=EXCLUDED.building, meet=0
             """,
             tg_id, today, code,
         )
@@ -2759,9 +2800,9 @@ async def networking_results_broadcast():
                         lines.append(f"• <a href='tg://user?id={p['tg_id']}'>{name}</a>")
 
                 text = (
-                        f"🤝 <b>Встреча у главного выхода — {html_module.escape(building_label)}</b>\n\n"
-                        f"Сегодня там же будут:\n" + "\n".join(lines) +
-                        "\n\nХорошей встречи! 🎉"
+                    f"🤝 <b>Встреча у главного выхода — {html_module.escape(building_label)}</b>\n\n"
+                    f"Сегодня там же будут:\n" + "\n".join(lines) +
+                    "\n\nХорошей встречи! 🎉"
                 )
 
             try:
@@ -2777,6 +2818,8 @@ async def networking_results_broadcast():
             await asyncio.sleep(0.05)
 
     logger.info(f"[NETWORKING] Results broadcast finished. Total sent: {sent}")
+
+
 # =====================================================================
 # ===================== ЗАДАЧА 2: ИГРА «БОЧКА» ========================
 # =====================================================================
@@ -2849,8 +2892,6 @@ async def story_monday_broadcast():
     """Понедельник 10:00 — первый вопрос недели с кнопками [Ответить]/[Не участвовать]."""
     logger.info("[STORY] Monday broadcast started")
 
-    # При старте новой недели сбрасываем REVEAL и чистим прошлые данные на всякий случай
-    # (основная очистка идёт в воскресенье 23:59, но дублируем безопасно)
     question = await get_story_question(0)
     if not question:
         logger.warning("[STORY] No question for Monday")
@@ -2887,18 +2928,20 @@ async def story_monday_deadline():
     for tg_id in recipients:
         participant = await get_story_participant(tg_id)
         if participant is None:
-            # Не нажал ничего — игнор
+            # Не нажал ничего — вылетает
             await set_story_participant_status(tg_id, "inactive")
         elif participant["status"] == "active":
-            # Нажал [Ответить], но не ответил — пусть остаётся active,
-            # завтра получит механизм "забыл вчера".
-            pass
+            # Проверяем, ответил ли на понедельничный вопрос
+            has_answer = await has_story_answer_for_day(tg_id, 0)
+            if not has_answer:
+                # Нажал [Ответить], но не прислал ответ — вылетает
+                await set_story_participant_status(tg_id, "inactive")
 
 
 async def story_daily_broadcast(day_of_week: int):
     """
     Вт-Чт: рассылка вопроса дня активным участникам.
-    Перед вопросом — текущий прогресс (HTML blockquote с троеточием).
+    Перед вопросом — текущий прогресс (HTML blockquote с троеточием и кавычками «»).
     Если человек пропустил вчера — сначала вчерашний вопрос, потом сегодняшний.
     """
     logger.info(f"[STORY] Daily broadcast for day {day_of_week}")
@@ -2932,7 +2975,7 @@ async def story_daily_broadcast(day_of_week: int):
                 progress_text = " ".join(html_module.escape(a["answer"]) for a in answers)
                 progress_msg = (
                     "📖 <b>Твоя история за прошлые дни:</b>\n"
-                    f"<blockquote>[{progress_text}]</blockquote>..."
+                    f"<blockquote>«{progress_text}»</blockquote>..."
                 )
                 await bot.send_message(tg_id, progress_msg, parse_mode=ParseMode.HTML)
                 await asyncio.sleep(0.1)
@@ -2990,7 +3033,7 @@ async def cb_story_skip(callback: CallbackQuery, state: FSMContext):
         pass
 
 
-# === STORY === Inline callback: ✏️ Ответить (на сегодняшний вопрос)
+# === STORY === Inline callback: ✏️ Ответить (на сегодняшний вопрос — понедельник)
 @router.callback_query(F.data == "story_join")
 async def cb_story_join(callback: CallbackQuery, state: FSMContext):
     """Понедельник: пользователь нажал ✏️ Ответить — переводим в FSM."""
@@ -3110,6 +3153,8 @@ async def process_story_answer_missed(message: Message, state: FSMContext):
     # Теперь даём сегодняшний вопрос
     today_dow = datetime.now().weekday()
     today_q = await get_story_question(today_dow)
+    if today_dow = datetime.now().weekday()
+    today_q = await get_story_question(today_dow)
     if today_q and not await has_story_answer_for_day(tg_id, today_dow):
         await bot.send_message(
             tg_id,
@@ -3120,7 +3165,6 @@ async def process_story_answer_missed(message: Message, state: FSMContext):
         )
     else:
         await show_main_menu(message)
-
 
 @router.message(StoryStates.waiting_answer, F.text)
 async def process_story_answer(message: Message, state: FSMContext):
