@@ -66,9 +66,9 @@ ALLOWED_SENDER_IDS: list[int] = []
 ALLOW_MESSAGES_FOR_ALL: bool = True
 
 # ===================== НОВАЯ КОНФИГУРАЦИЯ ФИЧ =====================
-ALLOW_NETWORKING_ALL = False        # Гео-нетворкинг — рассылка всем
-ALLOW_STORY_ALL = False             # Игра «Бочка» — рассылка всем
-REVEAL_STORIES = False              # Раскрыть истории всем (тумблер админа)
+ALLOW_NETWORKING_ALL = True        # Гео-нетворкинг — рассылка всем
+ALLOW_STORY_ALL = True             # Игра «Бочка» — рассылка всем
+REVEAL_STORIES = True              # Раскрыть истории всем (тумблер админа)
 TESTER_IDS = [1056843400, 5002429263]  # ID тестировщиков
 
 # Корпуса для гео-нетворкинга
