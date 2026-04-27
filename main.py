@@ -3319,7 +3319,7 @@ async def on_startup():
     # 12:10 Пн-Сб (day_of_week: mon-sat)
     scheduler.add_job(
         geo_send_question,
-        CronTrigger(hour=12, minute=10, day_of_week="mon-sat", timezone="Europe/Moscow"),
+        CronTrigger(hour=8, minute=40, day_of_week="mon-sat", timezone="Europe/Moscow"),
         id="geo_question",
         replace_existing=True,
     )
